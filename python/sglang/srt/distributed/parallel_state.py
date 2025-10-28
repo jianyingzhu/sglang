@@ -218,6 +218,7 @@ class GroupCoordinator:
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     use_torch_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
+    use_nvshmem_mem: bool  # a hint of whether to use NvshmemMem for symmetric memory operations
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
@@ -239,6 +240,7 @@ class GroupCoordinator:
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
+        use_nvshmem_communicator: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
@@ -299,6 +301,7 @@ class GroupCoordinator:
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
+        self.use_nvshmem_communicator = use_nvshmem_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
@@ -314,7 +317,10 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.symm_mem import (
             SymmMemCommunicator,
         )
-
+        from sglang.srt.distributed.device_communicators.nvshmem_communicator import (
+            NvshmemCommunicator,
+            nvshmem_is_available,
+        )
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -393,6 +399,16 @@ class GroupCoordinator:
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
+        # Create NVSHMEM communicator
+        self.nvshmem_comm: Optional[NvshmemCommunicator] = None
+        if use_nvshmem_communicator and nvshmem_is_available:
+            try:
+                self.nvshmem_comm = NvshmemCommunicator(
+                    group=self.cpu_group, device=self.device
+                )
+            except Exception as e:
+                logger.warning(f"Setup NVSHMEM communicator failed: {e}")
+                self.nvshmem_comm = None
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -1243,7 +1259,9 @@ class GroupCoordinator:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
-
+        if self.nvshmem_comm is not None:
+            self.nvshmem_comm.cleanup()
+            self.nvshmem_comm = None
 
 _WORLD: Optional[GroupCoordinator] = None
 
@@ -1267,6 +1285,7 @@ def init_world_group(
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
+        use_nvshmem_communicator=(os.environ.get('SGLANG_USE_NVSHMEM', '0') == '1'),
         group_name="world",
     )
 
