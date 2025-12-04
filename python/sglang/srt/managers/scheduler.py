@@ -768,6 +768,27 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                 )
+            elif server_args.enable_flexkv:
+                from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
+                    FlexKVRadixCache,
+                )
+
+                self.tree_cache = FlexKVRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=(
+                        self.attn_tp_cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_cpu_group
+                    ), # self.tp_group,
+                    eviction_policy=server_args.radix_eviction_policy,
+                )
             else:
                 self.tree_cache = RadixCache(params)
 
