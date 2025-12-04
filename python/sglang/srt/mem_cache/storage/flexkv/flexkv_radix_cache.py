@@ -345,16 +345,11 @@ class FlexKVConnector:
 class FlexKVRadixCache(RadixCache):
     def __init__(
         self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        page_size: int,
-        disable: bool = False,
-        enable_kv_cache_events: bool = False,
+        params,
         model_config: Optional[ModelConfig] = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        eviction_policy: str = "lru",
     ):
         # Initialize attributes needed by reset() method before calling super().__init__()
         self.rank = rank
@@ -367,33 +362,26 @@ class FlexKVRadixCache(RadixCache):
         self.sts_flexkv_cache_len = 0
 
         # Initialize FlexKV connector before super().__init__() since reset() method may use it
-        kvcache = token_to_kv_pool_allocator.get_kvcache()
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.flexkv_connector = FlexKVConnector(
             sgl_config=model_config,
-            page_size=page_size,
+            page_size=params.page_size,
             tp_size=tp_size,
             tp_rank=rank,
             tp_group=tp_group,            
             k_pool=getattr(
                 kvcache,
                 "k_buffer",
-                getattr(token_to_kv_pool_allocator._kvcache, "k_buffer"),
+                getattr(params.token_to_kv_pool_allocator._kvcache, "k_buffer"),
             ),
             v_pool=getattr(
                 kvcache,
                 "v_buffer",
-                getattr(token_to_kv_pool_allocator._kvcache, "v_buffer"),
+                getattr(params.token_to_kv_pool_allocator._kvcache, "v_buffer"),
             ),
         )
 
-        super().__init__(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            page_size=page_size,
-            disable=disable,
-            enable_kv_cache_events=enable_kv_cache_events,
-            eviction_policy=eviction_policy,
-        )
+        super().__init__(params)
 
     def reset(self):
         super().reset()
@@ -724,20 +712,3 @@ class FlexKVRadixCache(RadixCache):
                 f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
             )
 
-
-if __name__ == "__main__":
-    cache = FlexKVRadixCache(
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
-        page_size=1,
-        disable=False,
-        enable_kv_cache_events=False,
-        model_config=None,
-        tp_size=1,
-        rank=0,
-        tp_group=None,
-    )
-    cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 11, 12], dtype=torch.int64))
-    cache.insert(RadixKey([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13], dtype=torch.int64))
-    cache.pretty_print()
-    
