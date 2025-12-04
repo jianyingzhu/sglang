@@ -562,6 +562,7 @@ class ServerArgs:
 
     # LMCache
     enable_lmcache: bool = False
+    enable_flexkv: bool = False
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -4835,7 +4836,12 @@ class ServerArgs:
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
         )
-
+        # FlexKV
+        parser.add_argument(
+            "--enable-flexkv",
+            action="store_true",
+            help="Using FlexKV as an alternative distributed cache solution",
+        )        
         # Ktransformer server args
         parser.add_argument(
             "--kt-weight-path",
