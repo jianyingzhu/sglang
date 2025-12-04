@@ -567,6 +567,7 @@ class RadixCache(BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        return num_evicted
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:

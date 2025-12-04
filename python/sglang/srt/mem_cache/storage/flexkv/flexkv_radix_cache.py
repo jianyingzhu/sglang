@@ -1,0 +1,743 @@
+import time
+import torch
+import logging
+import threading
+import numpy as np
+from typing import List, Optional, Dict, Callable
+
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, RadixKey
+from sglang.srt.utils import broadcast_pyobj
+
+try:
+    from flexkv.kvmanager import KVManager
+    from flexkv.integration.config import FlexKVConfig
+    from flexkv.server.client import KVTPClient
+    from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+    from flexkv.common.request import KVResponseStatus
+except ImportError as e:
+    raise RuntimeError(
+        "FlexKV is not installed. Please install it."
+    ) from e
+
+logger = logging.getLogger(__name__)
+
+
+class FlexKVConnector:
+    """
+    Manages KV cache operations through FlexKV's distributed cache system.
+    """
+
+    def __init__(
+        self,
+        sgl_config: ModelConfig,
+        page_size: int,
+        tp_size: int,
+        tp_rank: int,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,        
+    ):
+
+        self.flexkv_config = FlexKVConfig.from_env()
+        self.flexkv_config.post_init_from_sglang_config(sglang_config=sgl_config,
+                                                        tp_size=tp_size,
+                                                        page_size=page_size)
+
+        self.sgl_config = sgl_config
+        self.tp_size = tp_size
+        self.rank = tp_rank
+        self.k_pool = k_pool
+        self.v_pool = v_pool
+        self.tp_group = tp_group
+
+        if self.rank == 0:
+            self.kv_manager = KVManager(
+                model_config=self.flexkv_config.model_config,
+                cache_config=self.flexkv_config.cache_config,
+                server_recv_port=self.flexkv_config.server_recv_port
+            )
+            self.kv_manager.start()
+
+        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
+        self.register_to_server(self.k_pool, self.v_pool)
+
+        # inflight_taskid2reqid: rank 0 only, inflight_reqid2node: all ranks, inflight_skipped_reqids: rank 0 only
+        
+        # task_id -> req_id mapping of store_async (only maintained on rank 0),
+        self.inflight_taskid2reqid: Dict[int, int] = {} if self.rank == 0 else {}
+        # req_ids that were skipped (no store launched) on rank 0; used to release locks on all ranks
+        self.inflight_skipped_reqids: List[int] = [] if self.rank == 0 else []
+
+        if self.rank == 0:
+            while not self.kv_manager.is_ready():
+                time.sleep(3)
+                logger.info("waiting for flexkv to be ready")
+            logger.info("flexkv is ready")
+
+        logger.info(f"FlexKV connector initialized for rank {self.rank}")
+
+    def chunk_size(self) -> int:
+        """Return the chunk size used by FlexKV."""
+        return self.flexkv_config.cache_config.tokens_per_block
+
+    def poll_completed_store_tasks(self) -> List[int]:
+        """
+        Non-blocking poll to collect completed async store tasks and return their req_ids (rank 0 only).
+        Other ranks return an empty list.
+        """
+        if self.rank == 0:
+            inflight_task_ids = list(self.inflight_taskid2reqid.keys())
+            if not inflight_task_ids:
+                return []
+            completed_dict = self.kv_manager.try_wait(task_ids=inflight_task_ids)  # task_id -> KVResponse
+            completed_req_ids: List[int] = []
+            for task_id in completed_dict:
+                req_id = self.inflight_taskid2reqid[task_id]
+                del self.inflight_taskid2reqid[task_id]
+                completed_req_ids.append(req_id)
+            if completed_req_ids:
+                logger.debug(f"[FlexKV] poll_completed_store_tasks: {len(completed_req_ids)} completed")
+            return completed_req_ids
+        else:
+            return []
+
+    def poll_skipped_store_tasks(self) -> List[int]:
+        """
+        Non-blocking poll to collect req_ids that were skipped (no store launched).
+        Rank 0 returns and clears the list; other ranks return [].
+        """
+        if self.rank == 0:
+            if not self.inflight_skipped_reqids:
+                return []
+            skipped = self.inflight_skipped_reqids
+            self.inflight_skipped_reqids = []
+            if skipped:
+                logger.debug(f"[FlexKV] poll_skipped_store_tasks: {len(skipped)} skipped")
+            return skipped
+        return []
+
+    def start_load_kv(
+        self,
+        token_ids: List[int],
+        slot_mapping: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+        inflight_reqid2node: Optional[Dict[int, TreeNode]] = None,
+        dec_lock_ref_fn: Optional[Callable[[TreeNode], None]] = None,
+    ) -> tuple[int, Optional[torch.Tensor]]:
+        """
+        Start loading KV cache from FlexKV storage.
+
+        Args:
+            token_ids: List of token IDs to load
+            slot_mapping: Tensor mapping for slots
+            token_mask: Optional mask indicating which tokens to load from FlexKV
+
+        Returns:
+            Tuple of (number of tokens loaded, loaded slot IDs tensor)
+        """
+
+        if self.rank == 0:
+            token_ids_np = np.array(token_ids, dtype=np.int64) # isinstance(token_ids, list):
+
+            task_id, matched_mask = self.kv_manager.get_match(
+                token_ids=token_ids_np,
+                token_mask=token_mask,
+            )
+
+            completed_req_ids = self.poll_completed_store_tasks()
+            skipped_req_ids = self.poll_skipped_store_tasks()
+
+            if matched_mask.sum() > 0:
+                filtered_slot_mapping = slot_mapping[matched_mask]
+                slot_mapping_cpu = filtered_slot_mapping.cpu() if filtered_slot_mapping.is_cuda else filtered_slot_mapping
+                logger.info(f"[FlexKV] launching load task_id={task_id}, matched_tokens={matched_mask.sum().item()}, slot_mapping_len={filtered_slot_mapping.numel()}")
+                self.kv_manager.launch(task_ids=[task_id], slot_mappings=[slot_mapping_cpu])
+                response = self.kv_manager.wait([task_id])
+                
+                if task_id in response and response[task_id].status == KVResponseStatus.SUCCESS:
+                    num_loaded = matched_mask.sum().item()
+                    requested_tokens = token_mask.sum().item() if token_mask is not None else len(token_ids)
+                    logger.debug(f"FlexKV loaded {num_loaded}/{requested_tokens} tokens from cache")
+
+                    loaded_slot_ids = filtered_slot_mapping
+                    # Update broadcast_data with actual values
+                    broadcast_data = {
+                        'num_loaded': num_loaded,
+                        'loaded_slot_ids': loaded_slot_ids,
+                        'completed_req_ids': completed_req_ids,
+                        'skipped_req_ids': skipped_req_ids,
+                    }
+            else:
+                broadcast_data = {
+                    'num_loaded': 0,
+                    'loaded_slot_ids': None,
+                    'completed_req_ids': completed_req_ids,
+                    'skipped_req_ids': skipped_req_ids,
+                }
+        else:
+            broadcast_data = None
+
+        if self.tp_group is not None and self.tp_size > 1:
+            logger.info(f"[FlexKV] broadcasting data to tp_group {self.tp_group} from rank {self.rank}")
+            broadcast_data = broadcast_pyobj([broadcast_data], self.rank, self.tp_group, src=0)[0]
+
+            # release locks for completed reqs
+            for req_id in broadcast_data['completed_req_ids']:
+                if req_id in inflight_reqid2node:
+                    node = inflight_reqid2node[req_id]
+                    logger.debug(
+                        f"[FlexKV] store completed (broadcast), releasing lock req={req_id} "
+                        f"node={node.id} key_len={len(node.key)}"
+                    )
+                    dec_lock_ref_fn(node)
+                    del inflight_reqid2node[req_id]
+            # release locks for skipped reqs
+            for req_id in broadcast_data.get('skipped_req_ids', []):
+                if req_id in inflight_reqid2node:
+                    node = inflight_reqid2node[req_id]
+                    logger.debug(
+                        f"[FlexKV] store skipped (broadcast), releasing lock req={req_id} "
+                        f"node={node.id} key_len={len(node.key)}"
+                    )
+                    dec_lock_ref_fn(node)
+                    del inflight_reqid2node[req_id]
+
+            return broadcast_data['num_loaded'], broadcast_data['loaded_slot_ids']
+        else:
+            # For single process case, return values from rank 0's broadcast_data
+            if self.rank == 0 and broadcast_data is not None:
+                # release locks for completed reqs
+                for req_id in broadcast_data['completed_req_ids']:
+                    if req_id in inflight_reqid2node:
+                        node = inflight_reqid2node[req_id]
+                        logger.debug(
+                            f"[FlexKV] store completed, releasing lock req={req_id} "
+                            f"node={node.id} key_len={len(node.key)}"
+                        )
+                        dec_lock_ref_fn(node)
+                        del inflight_reqid2node[req_id]
+                # release locks for skipped reqs
+                for req_id in broadcast_data.get('skipped_req_ids', []):
+                    if req_id in inflight_reqid2node:
+                        node = inflight_reqid2node[req_id]
+                        logger.debug(
+                            f"[FlexKV] store skipped, releasing lock req={req_id} "
+                            f"node={node.id} key_len={len(node.key)}"
+                        )
+                        dec_lock_ref_fn(node)
+                        del inflight_reqid2node[req_id]
+
+                return broadcast_data['num_loaded'], broadcast_data['loaded_slot_ids']
+            else:
+                # Fallback for non-rank0 or when no data was loaded
+                return 0, None
+
+    def store_kv_async(self, token_ids: List[int], kv_indices: torch.Tensor, req_id: int) -> int:
+        """
+        Store KV cache to FlexKV storage asynchronously.
+
+        Args:
+            token_ids: List of token IDs to store
+            kv_indices: Tensor of KV indices
+            req_id: Request ID for tracking
+
+        Returns:
+            task_id for tracking the async operation
+        """
+        try:
+            # Only tp0 performs actual FlexKV operations, other ranks return dummy task_id
+            if self.rank == 0:
+                token_ids_np = np.array(token_ids, dtype=np.int64) # isinstance(token_ids, list)                  
+                assert len(token_ids) == len(kv_indices), "token_ids and kv_indices must have the same length"
+                
+                task_id, unmatched_mask = self.kv_manager.put_match(
+                    token_ids=token_ids_np,
+                    token_mask=None,  # Store all tokens
+                )
+
+                if unmatched_mask.sum() > 0:
+                    filtered_kv_indices = kv_indices[unmatched_mask]
+                    slot_mapping_cpu = filtered_kv_indices.cpu() if filtered_kv_indices.is_cuda else filtered_kv_indices
+                    self.kv_manager.launch(task_ids=[task_id], slot_mappings=[slot_mapping_cpu])
+                    self.inflight_taskid2reqid[task_id] = req_id
+                    logger.debug(f"FlexKV storing {unmatched_mask.sum().item()}/{len(token_ids)} tokens to cache (async)")
+                    return task_id
+                else:
+                    logger.debug(f"All {len(token_ids)} tokens already in FlexKV cache")
+                    # record skipped store so locks can be released across ranks
+                    self.inflight_skipped_reqids.append(req_id)
+                    return -1  # No task launched
+            else:
+                # Other ranks don't perform actual operations
+                return -1
+
+        except Exception as e:
+            logger.error(f"FlexKV store_kv_async failed: {e}")
+            return -1
+
+    def wait_task(self, task_id: int, timeout: float = 20.0) -> bool:
+        """
+        Wait for a task to complete.
+
+        Args:
+            task_id: Task ID to wait for
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if task completed successfully, False otherwise
+        """
+        if task_id < 0:
+            return True  # No task to wait for (dummy task or no-op)
+
+        # Only tp0 has real tasks to wait for
+        if self.rank == 0:
+            try:
+                response = self.kv_manager.wait([task_id], timeout=timeout)
+                if task_id in response and response[task_id].status == KVResponseStatus.SUCCESS:
+                    logger.debug(f"FlexKV task {task_id} completed successfully")
+                    return True
+                else:
+                    logger.warning(f"FlexKV task {task_id} failed: status={response.get(task_id, {}).status if task_id in response else 'NOT_FOUND'}")
+                    return False
+            except Exception as e:
+                logger.error(f"FlexKV wait_task failed: {e}")
+                return False
+        else:
+            # Other ranks don't have real tasks, so always return success
+            return True
+
+    def register_to_server(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]) -> None:
+        logger.info("Start register kv_caches")
+        assert len(k_caches) == len(v_caches), "k_caches and v_caches must have the same length"
+        num_layer = len(k_caches)
+
+        # not mla
+        assert k_caches[0].ndim == 3, (
+            f"expect kv cached tensor has 3 dim but get shape={k_caches[0].shape}.")
+
+        num_layer = len(k_caches)
+        num_blocks = k_caches[0].shape[0]
+        num_kv_heads = k_caches[0].shape[1]
+        head_size = k_caches[0].shape[2]
+        gpu_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST,
+            num_layer=num_layer,
+            num_block=num_blocks,
+            tokens_per_block=1,
+            num_head=num_kv_heads,
+            head_size=head_size,
+            is_mla=False,
+            )
+        gpu_blocks = k_caches + v_caches
+        self.tp_client.register_to_server(gpu_blocks, gpu_layout)
+        logger.info("Finish register kv_caches")
+
+    def shutdown(self) -> None:
+        """Shutdown FlexKV connection."""
+        self.kv_manager.shutdown()
+
+
+class FlexKVRadixCache(RadixCache):
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        page_size: int,
+        disable: bool = False,
+        enable_kv_cache_events: bool = False,
+        model_config: Optional[ModelConfig] = None,
+        tp_size: int = 1,
+        rank: int = 0,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        eviction_policy: str = "lru",
+    ):
+        # Initialize attributes needed by reset() method before calling super().__init__()
+        self.rank = rank
+        self.tp_group = tp_group
+        
+        # Track req_id -> gpu last node, for all ranks
+        self.inflight_reqid2node: Dict[int, TreeNode] = {}
+        self.sts_total_seq_len = 0
+        self.sts_gpu_cache_len = 0
+        self.sts_flexkv_cache_len = 0
+
+        # Initialize FlexKV connector before super().__init__() since reset() method may use it
+        kvcache = token_to_kv_pool_allocator.get_kvcache()
+        self.flexkv_connector = FlexKVConnector(
+            sgl_config=model_config,
+            page_size=page_size,
+            tp_size=tp_size,
+            tp_rank=rank,
+            tp_group=tp_group,            
+            k_pool=getattr(
+                kvcache,
+                "k_buffer",
+                getattr(token_to_kv_pool_allocator._kvcache, "k_buffer"),
+            ),
+            v_pool=getattr(
+                kvcache,
+                "v_buffer",
+                getattr(token_to_kv_pool_allocator._kvcache, "v_buffer"),
+            ),
+        )
+
+        super().__init__(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            page_size=page_size,
+            disable=disable,
+            enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
+        )
+
+    def reset(self):
+        super().reset()
+        # Wait for all in-flight tasks before reset
+        # Only rank 0 needs to wait, other ranks just clear their mappings
+        if self.rank == 0:
+            task_ids = list(self.flexkv_connector.inflight_taskid2reqid.keys())
+            for task_id in task_ids:
+                self.flexkv_connector.wait_task(task_id)
+        
+        # All ranks clean up their node mappings
+        for _, node in self.inflight_reqid2node.items():
+            self.dec_lock_ref(node)
+        self.inflight_reqid2node.clear()       
+
+    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+        self.sts_total_seq_len += len(key)
+        if self.disable or not key:
+            return super().match_prefix(key, **kwargs)
+
+        if self.page_size != 1:
+            aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:aligned_len]
+
+        base_res = super().match_prefix(key, **kwargs)
+        value: torch.Tensor = base_res.device_indices
+        self.sts_gpu_cache_len += value.numel()
+        
+        last_node: TreeNode = base_res.last_device_node
+
+        uncached_len = len(key) - value.numel()
+        if uncached_len == 0:
+            return base_res
+
+        chunk_size = self.flexkv_connector.chunk_size()
+        prefix_pad = value.numel() % chunk_size
+
+        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+            self.evict(uncached_len)
+
+        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        if token_slots is None:
+            return base_res
+
+        slot_mapping = torch.cat(
+            [
+                torch.full((value.numel(),), -1, dtype=torch.int64, device=self.device),
+                token_slots.detach().clone().to(torch.int64).to(self.device),
+            ]
+        )
+
+        token_mask = torch.zeros(len(key), dtype=torch.bool)
+        token_mask[value.numel():] = True  # Only load uncached tokens
+
+        num_retrieved, loaded_slot_ids = self.flexkv_connector.start_load_kv(
+            token_ids=key.token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            inflight_reqid2node=self.inflight_reqid2node,
+            dec_lock_ref_fn=self.dec_lock_ref,
+        )
+        self.sts_flexkv_cache_len += num_retrieved
+        if self.rank == 0:
+            # logger.debug("num_retrieved_tokens: %s", num_retrieved)
+            logger.info(f"[FlexKV stats] total_seq_len={self.sts_total_seq_len}, "
+            f"gpu_cache_len={self.sts_gpu_cache_len}, flexkv_cache_len={self.sts_flexkv_cache_len}, "
+            f"gpu_cache_ratio={self.sts_gpu_cache_len / self.sts_total_seq_len}, "
+            f"flexkv_cache_ratio={self.sts_flexkv_cache_len / self.sts_total_seq_len}")
+
+        if num_retrieved > prefix_pad:
+            fetched = num_retrieved - prefix_pad
+            # Free unused token slots
+            self.token_to_kv_pool_allocator.free(
+                token_slots[fetched:]
+            )
+            
+            new_node = TreeNode()
+            start = value.numel()
+            end = start + fetched
+            new_node.key = key[start:end]
+            new_node.value = token_slots[:fetched]
+            new_node.parent = last_node
+            last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+            last_node = new_node
+
+            value = torch.cat([value, token_slots[:fetched]])
+            self.evictable_size_ += fetched
+
+            self._record_store_event(new_node.parent)
+            self._record_store_event(new_node)
+
+            return MatchResult(
+                device_indices=value,
+                last_device_node=last_node,
+                last_host_node=last_node,
+            )
+        else:
+            logger.debug(f"FlexKV retrieved {num_retrieved} tokens but need at least {prefix_pad} for alignment, freeing all allocated slots")
+            self.token_to_kv_pool_allocator.free(token_slots)
+
+        return base_res
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+        """
+        Cache finished request:
+        1. Insert into GPU radix tree (via super())
+        2. Store to FlexKV asynchronously
+        3. Track the node to prevent eviction during transfer
+        """
+        
+        # Periodically release completed store locks
+        try:
+            self._release_completed_store_locks()
+        except Exception:
+            pass
+        
+        # Insert into GPU radix tree
+        super().cache_finished_req(req, is_insert=is_insert)
+
+        if req.req_pool_idx is None:
+            logger.warning("[FlexKV] req_pool_idx is None, request may have been retracted")
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        new_last_node = req.last_node
+        if new_last_node is None:
+            logger.warning("[FlexKV] req.last_node is None, skipping FlexKV store")
+            return
+
+        self.inc_lock_ref(new_last_node)
+        try:
+            task_id = self.flexkv_connector.store_kv_async(
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+                req_id=req.req_pool_idx,
+            )
+        except Exception as e:
+            logger.error(f"[FlexKV] Failed to store KV: {e}")
+            return
+
+        if req.req_pool_idx in self.inflight_reqid2node:
+            self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
+            del self.inflight_reqid2node[req.req_pool_idx]
+            logger.debug(
+                f"[FlexKV] request {req.req_pool_idx} is already in inflight_reqid2node, decrement lock ref."
+            )
+
+        self.inflight_reqid2node[req.req_pool_idx] = new_last_node
+        logger.debug(
+            f"[FlexKV] store_lock added req={req.req_pool_idx} task={task_id} "
+            f"node={new_last_node.id} key_len={len(new_last_node.key)} "
+            f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
+        )
+        logger.debug(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
+
+    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+        """Cache request when it is unfinished."""
+
+        # # Periodically release completed store locks
+        # try:
+        #     self._release_completed_store_locks()
+        # except Exception:
+        #     pass
+
+        if self.disable:
+            return
+
+        token_ids = req.fill_ids
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
+
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        page_aligned_token_ids = token_ids[:page_aligned_len]
+
+        new_prefix_len = self.insert(
+            RadixKey(page_aligned_token_ids, req.extra_key), page_aligned_kv_indices, chunked=chunked
+        )
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[len(req.prefix_indices) : new_prefix_len]
+        )
+
+        match_res = super().match_prefix(RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key))
+        new_indices = match_res.device_indices
+        new_last_node = match_res.last_device_node
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
+            new_indices[len(req.prefix_indices) :],
+        )
+
+        self.dec_lock_ref(req.last_node)
+        self.inc_lock_ref(new_last_node)
+
+        if self.page_size != 1:
+            req.prefix_indices = torch.cat(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
+        else:
+            req.prefix_indices = new_indices
+        req.last_node = new_last_node
+
+        self.inc_lock_ref(new_last_node)
+        try:
+            task_id = self.flexkv_connector.store_kv_async(
+                token_ids=page_aligned_token_ids,
+                kv_indices=page_aligned_kv_indices,
+                req_id=req.req_pool_idx,
+            )
+        except Exception as e:
+            logger.error(f"[FlexKV] Failed to store KV: {e}")
+            return
+
+        if req.req_pool_idx in self.inflight_reqid2node:
+            self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
+            del self.inflight_reqid2node[req.req_pool_idx]
+            logger.debug(
+                f"[FlexKV] request {req.req_pool_idx} is already in inflight_reqid2node, decrement lock ref."
+            )
+
+        self.inflight_reqid2node[req.req_pool_idx] = new_last_node
+        logger.debug(
+            f"[FlexKV] store_lock added req={req.req_pool_idx} task={task_id} "
+            f"node={new_last_node.id} key_len={len(new_last_node.key)} "
+            f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
+        )
+        logger.info(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
+
+    def evict(self, num_tokens: int) -> None:
+        """
+        Try non-blocking release of completed FlexKV store tasks, evict, and only
+        if insufficient tokens are freed, block-wait remaining tasks and evict again.
+        """
+        if self.disable:
+            return
+
+        logger.info(f"[FlexKV] evict() called for {num_tokens} tokens, locked nodes: {len(self.inflight_reqid2node)}")
+
+        # Step 1: Non-blocking poll to release completed/skimmed store locks
+        try:
+            self._release_completed_store_locks()
+        except Exception:
+            pass
+
+        # Step 2: Attempt eviction with currently evictable nodes
+        evicted = super().evict(num_tokens)
+        if evicted >= num_tokens:
+            return
+
+        # Step 3: Not enough freed. Block-wait remaining FlexKV tasks, then release all locks and evict the rest.
+        remaining_reqids = list(self.inflight_reqid2node.keys())
+
+        if self.flexkv_connector.rank == 0:
+            task_ids = list(self.flexkv_connector.inflight_taskid2reqid.keys())
+            for task_id in task_ids:
+                logger.debug(f"[FlexKV] Waiting for task {task_id}")
+                self.flexkv_connector.wait_task(task_id)
+            self.flexkv_connector.inflight_taskid2reqid.clear()
+
+        for req_id in remaining_reqids:
+            node = self.inflight_reqid2node[req_id]
+            logger.debug(
+                f"[FlexKV] evict() releasing store_lock req={req_id} "
+                f"node={node.id} key_len={len(node.key)}"
+            )
+            self.dec_lock_ref(node)
+        self.inflight_reqid2node.clear()
+
+        remaining_to_evict = num_tokens - evicted
+        if remaining_to_evict > 0:
+            super().evict(remaining_to_evict)
+    
+    def pretty_print(self):
+        super().pretty_print()
+        try:
+            logger.debug(
+                "evictable=%d protected=%d", self.evictable_size_, self.protected_size_
+            )
+        except Exception:
+            pass
+
+    def _release_completed_store_locks(self) -> None:
+        """
+        Poll for completed store tasks and release corresponding locks.
+        Works for both single-rank and tensor-parallel multi-rank cases.
+        """
+        # Rank 0 polls the FlexKV manager; others will receive the broadcast payload.
+        completed_req_ids: List[int]
+        if self.flexkv_connector.rank == 0:
+            completed_req_ids = self.flexkv_connector.poll_completed_store_tasks()
+            skipped_req_ids = self.flexkv_connector.poll_skipped_store_tasks()
+        else:
+            completed_req_ids = []
+            skipped_req_ids = []
+
+        # Broadcast to all ranks if using tensor-parallel group
+        if self.tp_group is not None and self.flexkv_connector.tp_size > 1:
+            payload = {'completed_req_ids': completed_req_ids, 'skipped_req_ids': skipped_req_ids} if self.rank == 0 else None
+            payload = broadcast_pyobj([payload], self.rank, self.tp_group, src=0)[0]
+            to_release = (payload.get('completed_req_ids') or []) + (payload.get('skipped_req_ids') or [])
+        else:
+            to_release = completed_req_ids + skipped_req_ids
+
+        released = 0
+        for req_id in to_release:
+            if req_id in self.inflight_reqid2node:
+                node = self.inflight_reqid2node[req_id]
+                logger.debug(
+                    f"[FlexKV] periodic release store_lock req={req_id} "
+                    f"node={node.id} key_len={len(node.key)}"
+                )
+                self.dec_lock_ref(node)
+                del self.inflight_reqid2node[req_id]
+                released += 1
+        if released:
+            logger.debug(
+                f"[FlexKV] periodic released {released} store locks; "
+                f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
+            )
+
+
+if __name__ == "__main__":
+    cache = FlexKVRadixCache(
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        page_size=1,
+        disable=False,
+        enable_kv_cache_events=False,
+        model_config=None,
+        tp_size=1,
+        rank=0,
+        tp_group=None,
+    )
+    cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 11, 12], dtype=torch.int64))
+    cache.insert(RadixKey([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13], dtype=torch.int64))
+    cache.pretty_print()
+    
