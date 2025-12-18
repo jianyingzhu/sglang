@@ -583,6 +583,8 @@ class FlexKVRadixCache(RadixCache):
             new_indices[len(req.prefix_indices) :],
         )
 
+        req.cache_protected_len = len(new_indices)
+
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
