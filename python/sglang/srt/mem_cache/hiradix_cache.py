@@ -1088,7 +1088,7 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def check_hicache_events(self):
+    def check_kv_events(self):
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -1097,6 +1097,32 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def prefetch(self, req: Req) -> None:
+        req.init_next_round_input(self)
+        if req.last_node.backuped:
+            # only to initiate the prefetch if the last node is backuped
+            # otherwise, the allocated GPU memory must be locked for integrity
+            last_hash = req.last_host_node.get_last_hash_value()
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            new_input_tokens = req.fill_ids[matched_len:]
+
+            prefix_keys = (
+                req.last_node.get_prefix_hash_values(req.last_node.parent)
+                if self.hicache_storage_pass_prefix_keys
+                else None
+            )
+            self.prefetch_from_storage(
+                req.rid,
+                req.last_host_node,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+            )
+
+    def can_be_scheduled(self, req: Req) -> bool:
+        # skip staging requests that are ongoing prefetch
+        return not self.enable_storage or self.check_prefetch_progress(req.rid)
 
     def drain_storage_control_queues(self):
         """

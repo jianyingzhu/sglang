@@ -318,7 +318,7 @@ class TpModelWorker(BaseTpWorker):
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
-        self.hicache_layer_transfer_counter = None
+        self.layer_transfer_counter = None
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -400,12 +400,13 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
-    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
-        self.hicache_layer_transfer_counter = counter
+    def register_layer_transfer_counter(self, counter: LayerDoneCounter):
+        # now only for hicache and flexkv layer-by-layer transfer
+        self.layer_transfer_counter = counter
 
-    def set_hicache_consumer(self, consumer_index: int):
-        if self.hicache_layer_transfer_counter is not None:
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+    def set_consumer(self, consumer_index: int, forward_mode: str = "unknown"):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.set_consumer(consumer_index, forward_mode)
 
     def get_worker_info(self):
         return (
@@ -458,7 +459,8 @@ class TpModelWorker(BaseTpWorker):
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+            forward_mode_str = model_worker_batch.forward_mode.name if model_worker_batch.forward_mode else "unknown"
+            self.set_consumer(model_worker_batch.hicache_consumer_index, forward_mode_str)
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         else:

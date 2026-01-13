@@ -774,7 +774,10 @@ class Scheduler(
                         if self.server_args.enable_dp_attention
                         else self.tp_cpu_group
                     ), # self.tp_group,
-                )            
+                )
+                self.tp_worker.register_layer_transfer_counter(
+                    self.tree_cache.layer_done_counter
+                )
             else:
                 self.tree_cache = RadixCache(params)
 
@@ -2188,8 +2191,8 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+        # Check hierarchical cache events (no-op for non-hierarchical cache)
+        self.tree_cache.check_kv_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2952,9 +2955,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
+            # to release prefetch events associated with the request
+            self.tree_cache.release_aborted_request(req)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

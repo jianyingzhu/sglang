@@ -1,3 +1,4 @@
+import os
 import time
 import torch
 import logging
@@ -12,6 +13,15 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, RadixKey
 from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.managers.flexkv_ipc_utils import (
+    eventfd,
+    eventfd_read,
+    eventfd_write,
+    send_fds,
+    EFD_SEMAPHORE,
+)
+import socket
+import struct
 
 try:
     from flexkv.kvmanager import KVManager
@@ -25,6 +35,116 @@ except ImportError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
+
+
+class FlexKVLoadOperation:
+    """Represents a pending KV cache load operation from FlexKV to GPU."""
+    
+    def __init__(
+        self,
+        task_id: int,                  # FlexKV task_id from get_match (saved to avoid re-query)
+        device_indices: torch.Tensor,  # GPU slots for tokens to load
+        node_id: int,
+    ):
+        self.task_id = task_id
+        self.device_indices = device_indices
+        self.node_id = node_id
+        self.host_hit_length = device_indices.numel()
+
+class FlexKVLayerLoadingEvent:
+    def __init__(self, num_layers: int):
+        self._num_layers = num_layers
+        self.load_event_fds: List[int] = []
+        for _ in range(num_layers):
+            self.load_event_fds.append(eventfd(0, EFD_SEMAPHORE)) # Use EFD_SEMAPHORE: each read decrements counter by 1
+        
+        self._finished = True # Track if all layers are done, initially True so that first update_producer() can proceed
+        self._last_layer_wait_count = 0  # Track waits on last layer (K and V each wait once)
+        logger.info(f"[FlexKV] Created FlexKVLayerLoadingEvent with fds: {self.load_event_fds[:5]}...{self.load_event_fds[-1]}")
+
+    def reset_for_new_transfer(self):
+        """Reset state for a new transfer. Called when producer starts using this event."""
+        self._finished = False
+        self._last_layer_wait_count = 0
+
+    def wait(self, layer_index: int):
+        assert 0 <= layer_index < self._num_layers
+        fd = self.load_event_fds[layer_index]
+        logger.debug(f"[FlexKV] eventfd_read START: layer={layer_index}, fd={fd}")
+        eventfd_read(fd) # Blocking read - SGLang hangs here until FlexKV signals via eventfd_write
+        logger.debug(f"[FlexKV] eventfd_read DONE: layer={layer_index}, fd={fd}")
+        
+        # Track waits on last layer and mark finished when all are done
+        if layer_index == self._num_layers - 1:
+            self._last_layer_wait_count += 1
+            if self._last_layer_wait_count >= 2:
+                self._finished = True
+                logger.debug(f"[FlexKV] All layers completed, marking event as finished")
+
+    # def reset(self):
+    #     self._finished = False
+
+    def close(self):
+        for fd in self.load_event_fds:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        self.load_event_fds.clear()
+
+    def __del__(self):
+        self.close()
+
+
+class FlexKVLayerDoneCounter:
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        # Extra producer and consumer counters for overlap mode (triple buffering)
+        self.num_counters = 3
+        self.events: List[FlexKVLayerLoadingEvent] = [
+            FlexKVLayerLoadingEvent(num_layers) for _ in range(self.num_counters)
+        ]
+        self.producer_index = -1
+        self.consumer_index = -1
+        # Counter per layer: wait executes until count reaches 0 (need 2 waits for K and V)
+        self.wait_remaining: List[int] = [2] * num_layers
+
+    def update_producer(self) -> int:
+        self.producer_index = (self.producer_index + 1) % self.num_counters
+        assert self.events[
+            self.producer_index
+        ]._finished, (
+            "Producer finish event should be ready before being reused."
+        )
+        # Reset wait counters for all layers for new producer (need 2 waits per layer)
+        self.wait_remaining = [2] * self.num_layers
+        return self.producer_index
+
+    def set_consumer(self, index: int, forward_mode: str = "unknown"):
+        if index >= 0:
+            logger.info(f"[FlexKV] set_consumer: index={index}, forward_mode={forward_mode}")
+        self.consumer_index = index
+
+    def wait_until(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        # Wait until count reaches 0 (need 2 waits for K and V, then skip subsequent calls)
+        if self.wait_remaining[threshold] <= 0:
+            logger.debug(f"[FlexKV] wait_until: wait_remaining[{threshold}]=0, skipping wait for consumer_index={self.consumer_index}, layer={threshold} of DECODE")
+            return
+        self.wait_remaining[threshold] -= 1
+        logger.debug(f"[FlexKV] wait_until: consumer_index={self.consumer_index}, layer={threshold}, wait_remaining={self.wait_remaining[threshold]}")
+        self.events[self.consumer_index].wait(threshold)
+
+    def reset(self):
+        self.producer_index = -1
+        self.consumer_index = -1
+
+    def __del__(self):
+        # not called
+        for event in self.events:
+            event.close()
+        self.events.clear()
 
 
 class FlexKVConnector:
@@ -73,13 +193,107 @@ class FlexKVConnector:
         # req_ids that were skipped (no store launched) on rank 0; used to release locks on all ranks
         self.inflight_skipped_reqids: List[int] = [] if self.rank == 0 else []
 
+        logger.info(f"FlexKV connector initialized for rank {self.rank}")
+        
+        # Layer-by-layer transfer components
+        self.num_layers = sgl_config.num_hidden_layers if sgl_config is not None else 0
+        self.layer_done_counter: Optional[FlexKVLayerDoneCounter] = None
+        self._worker_connected = False
+        
+        # Socket path for eventfd IPC (from FlexKV config or default)
+        self.layerwise_eventfd_socket = os.environ.get(
+            'FLEXKV_LAYERWISE_EVENTFD_SOCKET', '/tmp/flexkv_layerwise_eventfd.sock'
+        )
+        
+
+        self._init_layer_transfer_components()
+
         if self.rank == 0:
             while not self.kv_manager.is_ready():
                 time.sleep(3)
                 logger.info("waiting for flexkv to be ready")
             logger.info("flexkv is ready")
 
-        logger.info(f"FlexKV connector initialized for rank {self.rank}")
+    def _init_layer_transfer_components(self):
+        """
+        Initialize layer-by-layer transfer components for all ranks.
+        Each rank creates FlexKVLayerDoneCounter with eventfds and sends them
+        to the LayerwiseTransferWorker via Unix domain socket.
+        
+        The worker receives eventfds from each tp_rank and uses them for 
+        layer-by-layer signaling.
+        """
+        # Create layer done counter with eventfds
+        self.layer_done_counter = FlexKVLayerDoneCounter(self.num_layers)
+        
+        # Connect to FlexKV LayerwiseTransferWorker and send eventfds
+        self._send_eventfds_to_worker()
+        
+        logger.info(f"[FlexKV] Rank {self.rank}: Initialized layer transfer, sent eventfds to worker")
+
+    def _send_eventfds_to_worker(self, max_retries: int = 120, retry_interval: float = 1.0):
+        """
+        Connect to FlexKV LayerwiseTransferWorker via Unix socket and send all 3 sets of eventfds.
+        
+        Protocol:
+        1. Connect to worker's Unix socket (retry until worker is ready)
+        2. Send metadata: tp_rank, tp_size, num_layers, num_counters (as struct)
+        3. For each counter (3 sets), send all layer eventfds via send_fds
+        """
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        
+        # Retry connection until worker's server socket is ready
+        connected = False
+        for attempt in range(max_retries):
+            try:
+                sock.connect(self.layerwise_eventfd_socket)
+                logger.info(f"[FlexKV] Rank {self.rank}: Connected to worker socket {self.layerwise_eventfd_socket}")
+                connected = True
+                break
+            except (FileNotFoundError, ConnectionRefusedError) as e:
+                if attempt < max_retries - 1:
+                    if attempt % 10 == 0:  # Log every 10 attempts to reduce spam
+                        logger.info(f"[FlexKV] Rank {self.rank}: Worker not ready, retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(retry_interval)
+                else:
+                    logger.error(f"[FlexKV] Rank {self.rank}: Failed to connect to worker after {max_retries} attempts")
+                    sock.close()
+                    self._worker_connected = False
+                    return
+        
+        if not connected:
+            sock.close()
+            self._worker_connected = False
+            return
+        
+        try:
+            # Send metadata: tp_rank, tp_size, num_layers, num_counters
+            num_counters = self.layer_done_counter.num_counters
+            metadata = struct.pack("iiii", self.rank, self.tp_size, self.num_layers, num_counters)
+            sock.sendall(metadata)
+            
+            # For each counter set (3 sets), send all layer eventfds
+            for counter_id in range(num_counters):
+                event = self.layer_done_counter.events[counter_id]
+                fds = event.load_event_fds  # List of num_layers eventfds
+                # Pack counter_id as extra data
+                extra_data = struct.pack("i", counter_id)
+                send_fds(sock, fds, extra_data)
+                logger.debug(f"[FlexKV] Rank {self.rank}: Sent eventfds for counter {counter_id}, num_fds={len(fds)}")
+            
+            self._worker_connected = True
+            logger.info(f"[FlexKV] Rank {self.rank}: Successfully sent all {num_counters} sets of eventfds")
+            
+        except Exception as e:
+            logger.error(f"[FlexKV] Rank {self.rank}: Failed to send eventfds: {e}")
+            self._worker_connected = False
+        finally:
+            sock.close()
+
+    def register_layer_transfer_counter(self, kvcache) -> None:
+        """Register layer done counter with the KV cache (only effective on rank 0)."""
+        if self.layer_done_counter is not None:
+            kvcache.register_layer_transfer_counter(self.layer_done_counter)
 
     def chunk_size(self) -> int:
         """Return the chunk size used by FlexKV."""
@@ -311,6 +525,45 @@ class FlexKVConnector:
             # Other ranks don't have real tasks, so always return success
             return True
 
+    def launch_layerwise_batch_transfer(
+        self,
+        load_queue: List["FlexKVLoadOperation"],
+        producer_id: int = 0,
+    ) -> int:
+        if self.rank != 0:
+            # Other ranks don't perform actual operations
+            return 0
+        
+        logger.debug(f"[FlexKV] launch_layerwise_batch_transfer: load_queue size={len(load_queue)}, producer_id={producer_id}")
+        
+        task_ids = []
+        slot_mappings = []
+        
+        for op in load_queue:
+            # Use saved task_id directly, no need to re-call get_match
+            if op.task_id < 0:
+                logger.warning(f"[FlexKV] Invalid task_id {op.task_id} for node {op.node_id}, skipping")
+                continue
+            
+            slot_mapping_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+            task_ids.append(op.task_id)
+            slot_mappings.append(slot_mapping_cpu)
+            logger.debug(f"[FlexKV] Using saved task_id={op.task_id}, host_hit_length={op.host_hit_length}")
+        
+        if task_ids:
+            self.kv_manager.launch(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                as_batch=True,
+                layerwise_transfer=True,
+                counter_id=producer_id,
+            )
+            logger.info(f"[FlexKV] Launched {len(task_ids)} layerwise transfer tasks as batch, producer_id={producer_id}")
+        else:
+            logger.warning(f"[FlexKV] No valid tasks for layerwise transfer, load_queue size was {len(load_queue)}")
+        
+        return len(task_ids)
+
     def register_to_server(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]) -> None:
         logger.info("Start register kv_caches")
         assert len(k_caches) == len(v_caches), "k_caches and v_caches must have the same length"
@@ -380,7 +633,19 @@ class FlexKVRadixCache(RadixCache):
                 getattr(params.token_to_kv_pool_allocator._kvcache, "v_buffer"),
             ),
         )
+        
+        # Get layer transfer components from connector (created on rank 0 only)
+        self.layer_done_counter = self.flexkv_connector.layer_done_counter
+        self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
+        self.num_layers = model_config.num_hidden_layers if model_config is not None else 0
+        self.tp_size = tp_size
+
+        # Load queue for pending FlexKV -> GPU transfer operations
+        self.load_queue: List[FlexKVLoadOperation] = []
+        # Pending load info from match_prefix: node_id -> (token_ids, gpu_cached_len)
+        self.pending_load_info: Dict[int, tuple] = {}
+        
         super().__init__(params)
 
     def reset(self):
@@ -395,9 +660,100 @@ class FlexKVRadixCache(RadixCache):
         # All ranks clean up their node mappings
         for _, node in self.inflight_reqid2node.items():
             self.dec_lock_ref(node)
-        self.inflight_reqid2node.clear()       
+        self.inflight_reqid2node.clear()
+        
+        # Free memory from pending load operations before clearing
+        self._free_load_queue_memory()
+        self.pending_load_info.clear()       
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+        # self.sts_total_seq_len += len(key)
+        # if self.disable or not key:
+        #     return super().match_prefix(key, **kwargs)
+
+        # if self.page_size != 1:
+        #     aligned_len = len(key) // self.page_size * self.page_size
+        #     key = key[:aligned_len]
+
+        # base_res = super().match_prefix(key, **kwargs)
+        # value: torch.Tensor = base_res.device_indices
+        # self.sts_gpu_cache_len += value.numel()
+        
+        # last_node: TreeNode = base_res.last_device_node
+
+        # uncached_len = len(key) - value.numel()
+        # if uncached_len == 0:
+        #     return base_res
+
+        # chunk_size = self.flexkv_connector.chunk_size()
+        # prefix_pad = value.numel() % chunk_size
+
+        # if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+        #     self.evict(uncached_len)
+
+        # token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        # if token_slots is None:
+        #     return base_res
+
+        # slot_mapping = torch.cat(
+        #     [
+        #         torch.full((value.numel(),), -1, dtype=torch.int64, device=self.device),
+        #         token_slots.detach().clone().to(torch.int64).to(self.device),
+        #     ]
+        # )
+
+        # token_mask = torch.zeros(len(key), dtype=torch.bool)
+        # token_mask[value.numel():] = True  # Only load uncached tokens
+
+        # num_retrieved, loaded_slot_ids = self.flexkv_connector.start_load_kv(
+        #     token_ids=key.token_ids,
+        #     slot_mapping=slot_mapping,
+        #     token_mask=token_mask,
+        #     inflight_reqid2node=self.inflight_reqid2node,
+        #     dec_lock_ref_fn=self.dec_lock_ref,
+        # )
+        # self.sts_flexkv_cache_len += num_retrieved
+        # if self.rank == 0:
+        #     # logger.debug("num_retrieved_tokens: %s", num_retrieved)
+        #     logger.info(f"[FlexKV stats] total_seq_len={self.sts_total_seq_len}, "
+        #     f"gpu_cache_len={self.sts_gpu_cache_len}, flexkv_cache_len={self.sts_flexkv_cache_len}, "
+        #     f"gpu_cache_ratio={self.sts_gpu_cache_len / self.sts_total_seq_len}, "
+        #     f"flexkv_cache_ratio={self.sts_flexkv_cache_len / self.sts_total_seq_len}")
+
+        # if num_retrieved > prefix_pad:
+        #     fetched = num_retrieved - prefix_pad
+        #     # Free unused token slots
+        #     self.token_to_kv_pool_allocator.free(
+        #         token_slots[fetched:]
+        #     )
+            
+        #     new_node = TreeNode()
+        #     start = value.numel()
+        #     end = start + fetched
+        #     new_node.key = key[start:end]
+        #     new_node.value = token_slots[:fetched]
+        #     new_node.parent = last_node
+        #     last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+        #     last_node = new_node
+
+        #     value = torch.cat([value, token_slots[:fetched]])
+        #     self.evictable_size_ += fetched
+
+        #     self._record_store_event(new_node.parent)
+        #     self._record_store_event(new_node)
+
+        #     return MatchResult(
+        #         device_indices=value,
+        #         last_device_node=last_node,
+        #         last_host_node=last_node,
+        #     )
+        # else:
+        #     logger.debug(f"FlexKV retrieved {num_retrieved} tokens but need at least {prefix_pad} for alignment, freeing all allocated slots")
+        #     self.token_to_kv_pool_allocator.free(token_slots)
+
+        # return base_res
+
+        # ===== match only, no transfer =====
         self.sts_total_seq_len += len(key)
         if self.disable or not key:
             return super().match_prefix(key, **kwargs)
@@ -406,83 +762,190 @@ class FlexKVRadixCache(RadixCache):
             aligned_len = len(key) // self.page_size * self.page_size
             key = key[:aligned_len]
 
+        # First, match against GPU radix cache
         base_res = super().match_prefix(key, **kwargs)
         value: torch.Tensor = base_res.device_indices
         self.sts_gpu_cache_len += value.numel()
-        
+
         last_node: TreeNode = base_res.last_device_node
 
         uncached_len = len(key) - value.numel()
         if uncached_len == 0:
             return base_res
 
-        chunk_size = self.flexkv_connector.chunk_size()
-        prefix_pad = value.numel() % chunk_size
-
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(uncached_len)
-
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
-        if token_slots is None:
-            return base_res
-
-        slot_mapping = torch.cat(
-            [
-                torch.full((value.numel(),), -1, dtype=torch.int64, device=self.device),
-                token_slots.detach().clone().to(torch.int64).to(self.device),
-            ]
-        )
-
-        token_mask = torch.zeros(len(key), dtype=torch.bool)
-        token_mask[value.numel():] = True  # Only load uncached tokens
-
-        num_retrieved, loaded_slot_ids = self.flexkv_connector.start_load_kv(
-            token_ids=key.token_ids,
-            slot_mapping=slot_mapping,
-            token_mask=token_mask,
-            inflight_reqid2node=self.inflight_reqid2node,
-            dec_lock_ref_fn=self.dec_lock_ref,
-        )
-        self.sts_flexkv_cache_len += num_retrieved
+        # Query FlexKV to see what tokens are available (match only, no transfer)
+        flexkv_hit_length = 0
+        flexkv_task_id = -1
         if self.rank == 0:
-            # logger.debug("num_retrieved_tokens: %s", num_retrieved)
+            token_ids_np = np.array(key.token_ids, dtype=np.int64)
+            token_mask = torch.zeros(len(key), dtype=torch.bool)
+            token_mask[value.numel():] = True  # Only check uncached tokens
+
+            flexkv_task_id, matched_mask = self.flexkv_connector.kv_manager.get_match(
+                token_ids=token_ids_np,
+                token_mask=token_mask,
+            )
+            # not launch task of transfer, just match
+            flexkv_hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+
+        # Broadcast flexkv_hit_length and task_id to all ranks if in TP mode
+        if self.tp_group is not None and self.flexkv_connector.tp_size > 1:
+            broadcast_data = broadcast_pyobj([{
+                'flexkv_hit_length': flexkv_hit_length,
+                'flexkv_task_id': flexkv_task_id,
+            }], self.rank, self.tp_group, src=0)[0]
+            flexkv_hit_length = broadcast_data['flexkv_hit_length']
+            flexkv_task_id = broadcast_data['flexkv_task_id']
+
+        self.sts_flexkv_cache_len += flexkv_hit_length
+        if self.rank == 0:
             logger.info(f"[FlexKV stats] total_seq_len={self.sts_total_seq_len}, "
-            f"gpu_cache_len={self.sts_gpu_cache_len}, flexkv_cache_len={self.sts_flexkv_cache_len}, "
-            f"gpu_cache_ratio={self.sts_gpu_cache_len / self.sts_total_seq_len}, "
-            f"flexkv_cache_ratio={self.sts_flexkv_cache_len / self.sts_total_seq_len}")
+                        f"gpu_cache_len={self.sts_gpu_cache_len}, flexkv_cache_len={self.sts_flexkv_cache_len}, "
+                        f"gpu_cache_ratio={self.sts_gpu_cache_len / self.sts_total_seq_len:.4f}, "
+                        f"flexkv_cache_ratio={self.sts_flexkv_cache_len / self.sts_total_seq_len:.4f}")
 
-        if num_retrieved > prefix_pad:
-            fetched = num_retrieved - prefix_pad
-            # Free unused token slots
-            self.token_to_kv_pool_allocator.free(
-                token_slots[fetched:]
-            )
+        # Store task_id for init_load_back (avoid re-calling get_match)
+        if flexkv_hit_length > 0:
+            self.pending_load_info[last_node.id] = flexkv_task_id
+
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node, # not used for FlexKV, used for hicache prefetch and init_load_back
+            host_hit_length=flexkv_hit_length,
+        )
+
+    def init_load_back(
+        self,
+        last_node: TreeNode,
+        host_hit_length: int,
+        mem_quota: Optional[int] = None,        
+    ):
+        """
+        Allocate GPU memory and add the load operation to load_queue.
+        The actual transfer is triggered by ready_to_load_host_cache().
+        
+        Args:
+            last_node: The last node from match_prefix
+            host_hit_length: Number of tokens hit in FlexKV storage
+            mem_quota: Optional memory quota limit
             
-            new_node = TreeNode()
-            start = value.numel()
-            end = start + fetched
-            new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
-            new_node.parent = last_node
-            last_node.children[self.get_child_key_fn(new_node.key)] = new_node
-            last_node = new_node
-
-            value = torch.cat([value, token_slots[:fetched]])
-            self.evictable_size_ += fetched
-
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
-
-            return MatchResult(
-                device_indices=value,
-                last_device_node=last_node,
-                last_host_node=last_node,
+        Returns:
+            Tuple of (device_indices tensor, updated last_node)
+        """
+        if host_hit_length <= 0:
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
             )
-        else:
-            logger.debug(f"FlexKV retrieved {num_retrieved} tokens but need at least {prefix_pad} for alignment, freeing all allocated slots")
-            self.token_to_kv_pool_allocator.free(token_slots)
+        
+        # Get task_id stored during match_prefix
+        task_id = self.pending_load_info.pop(last_node.id, None)
+        if task_id is None:
+            logger.warning(f"[FlexKV] No pending task_id found for node {last_node.id}")
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
+        
+        # Check memory quota
+        if mem_quota is not None and host_hit_length > mem_quota:
+            logger.debug(f"[FlexKV] host_hit_length {host_hit_length} exceeds mem_quota {mem_quota}, skipping load")
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
+        
+        # Allocate GPU memory for the tokens to load
+        device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
+        if device_indices is None:
+            # Try eviction and retry
+            self.evict(host_hit_length)
+            device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
+        
+        if device_indices is None:
+            logger.warning(f"[FlexKV] Failed to allocate {host_hit_length} GPU slots for load")
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
+        
+        # Create load operation with saved task_id (no need to re-call get_match)
+        load_op = FlexKVLoadOperation(
+            task_id=task_id,
+            device_indices=device_indices,
+            node_id=last_node.id,
+        )
+        self.load_queue.append(load_op)
+        
+        logger.debug(f"[FlexKV] init_load_back: queued {host_hit_length} tokens for node {last_node.id}, task_id={task_id}")
+        
+        
+        return device_indices, last_node
+    
+    def _free_load_queue_memory(self) -> None:
+        """
+        Free GPU memory allocated for pending load operations in load_queue.
+        This is called when transfer cannot proceed (worker not connected, etc.) to prevent memory leaks.
+        """
+        if not self.load_queue:
+            return
+        
+        freed_tokens = 0
+        for load_op in self.load_queue:
+            if load_op.device_indices is not None and load_op.device_indices.numel() > 0:
+                self.token_to_kv_pool_allocator.free(load_op.device_indices)
+                freed_tokens += load_op.device_indices.numel()
+        
+        if freed_tokens > 0:
+            logger.debug(f"[FlexKV] Freed {freed_tokens} tokens from cancelled load operations")
+        
+        self.load_queue.clear()
 
-        return base_res
+    def ready_to_load_host_cache(self) -> int:
+        """
+        Trigger the actual layer-by-layer transfer from FlexKV to GPU.
+        The LayerwiseTransferWorker in FlexKV performs the transfer and signals
+        each layer completion via eventfd_write.
+
+        Flow:
+        1. SGLang creates eventfds in FlexKVLayerLoadingEvent (during init)
+        2. SGLang sends those eventfds to the worker via Unix socket (during init)
+        3. SGLang triggers transfer via KVManager.launch() 
+        4. Worker receives task and performs layer-by-layer transfer
+        5. Worker signals each layer completion via eventfd_write
+        6. SGLang waits on each layer's eventfd before computing
+
+        Returns:
+            Consumer index for the scheduler to track layer-by-layer progress,
+            or -1 if no operations to process.
+        """
+        if not self.flexkv_connector._worker_connected:
+            logger.warning("[FlexKV] Worker not connected, skipping layer-by-layer transfer")
+            self._free_load_queue_memory()  # Free allocated memory to prevent leak
+            return -1
+        
+        if self.layer_done_counter is None:
+            logger.warning("[FlexKV] Layer done counter not available, skipping")
+            self._free_load_queue_memory()  # Free allocated memory to prevent leak
+            return -1
+        
+        if not self.load_queue:
+            logger.debug("[FlexKV] ready_to_load_host_cache: load_queue is empty")
+            return -1
+        
+        logger.info(f"[FlexKV] ready_to_load_host_cache: triggering layerwise transfer for {len(self.load_queue)} ops")
+        producer_id = self.layer_done_counter.update_producer()
+        # Reset event state for new transfer (marks as not finished and resets wait counter)
+        self.layer_done_counter.events[producer_id].reset_for_new_transfer()
+        
+        # Launch layerwise batch transfer (rank 0 only, other ranks do nothing)
+        # Pass producer_id so FlexKV knows which eventfd set to use for notification
+        self.flexkv_connector.launch_layerwise_batch_transfer(self.load_queue, producer_id)
+        
+        self.load_queue.clear()
+        
+        return producer_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """
