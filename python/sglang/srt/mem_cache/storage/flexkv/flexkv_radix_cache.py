@@ -45,18 +45,19 @@ class FlexKVLoadOperation:
         task_id: int,                  # FlexKV task_id from get_match (saved to avoid re-query)
         device_indices: torch.Tensor,  # GPU slots for tokens to load
         node_id: int,
+        node: Optional[TreeNode] = None,  # Reference to the created TreeNode for cleanup
     ):
         self.task_id = task_id
         self.device_indices = device_indices
         self.node_id = node_id
+        self.node = node  # For cleanup when transfer is cancelled
         self.host_hit_length = device_indices.numel()
 
 class FlexKVLayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_event_fds: List[int] = []
-        for _ in range(num_layers):
-            self.load_event_fds.append(eventfd(0, EFD_SEMAPHORE)) # Use EFD_SEMAPHORE: each read decrements counter by 1
+        self.load_event_fds = [eventfd(0, EFD_SEMAPHORE) for _ in range(num_layers)] # Use EFD_SEMAPHORE: each read decrements counter by 1
         
         self._finished = True # Track if all layers are done, initially True so that first update_producer() can proceed
         self._last_layer_wait_count = 0  # Track waits on last layer (K and V each wait once)
@@ -120,9 +121,9 @@ class FlexKVLayerDoneCounter:
         self.wait_remaining = [2] * self.num_layers
         return self.producer_index
 
-    def set_consumer(self, index: int, forward_mode: str = "unknown"):
+    def set_consumer(self, index: int):
         if index >= 0:
-            logger.info(f"[FlexKV] set_consumer: index={index}, forward_mode={forward_mode}")
+            logger.info(f"[FlexKV] set_consumer: index={index}")
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
@@ -645,6 +646,8 @@ class FlexKVRadixCache(RadixCache):
         self.load_queue: List[FlexKVLoadOperation] = []
         # Pending load info from match_prefix: node_id -> (token_ids, gpu_cached_len)
         self.pending_load_info: Dict[int, tuple] = {}
+        # Track ongoing load operations: node_id -> (node, producer_id)
+        self.ongoing_load_back: Dict[int, tuple] = {}
         
         super().__init__(params)
 
@@ -662,8 +665,11 @@ class FlexKVRadixCache(RadixCache):
             self.dec_lock_ref(node)
         self.inflight_reqid2node.clear()
         
-        # Free memory from pending load operations before clearing
-        self._free_load_queue_memory()
+        for _, (node, _) in self.ongoing_load_back.items():
+            self.dec_lock_ref(node)
+        self.ongoing_load_back.clear()
+
+        self.load_queue.clear()
         self.pending_load_info.clear()       
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
@@ -804,9 +810,9 @@ class FlexKVRadixCache(RadixCache):
                         f"gpu_cache_ratio={self.sts_gpu_cache_len / self.sts_total_seq_len:.4f}, "
                         f"flexkv_cache_ratio={self.sts_flexkv_cache_len / self.sts_total_seq_len:.4f}")
 
-        # Store task_id for init_load_back (avoid re-calling get_match)
+        # Store (task_id, key, gpu_cached_len) for init_load_back (avoid re-calling get_match)
         if flexkv_hit_length > 0:
-            self.pending_load_info[last_node.id] = flexkv_task_id
+            self.pending_load_info[last_node.id] = (flexkv_task_id, key, value.numel())
 
         return MatchResult(
             device_indices=value,
@@ -822,7 +828,7 @@ class FlexKVRadixCache(RadixCache):
         mem_quota: Optional[int] = None,        
     ):
         """
-        Allocate GPU memory and add the load operation to load_queue.
+        Allocate GPU memory, create new TreeNode, and add the load operation to load_queue.
         The actual transfer is triggered by ready_to_load_host_cache().
         
         Args:
@@ -839,14 +845,16 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
         
-        # Get task_id stored during match_prefix
-        task_id = self.pending_load_info.pop(last_node.id, None)
-        if task_id is None:
-            logger.warning(f"[FlexKV] No pending task_id found for node {last_node.id}")
+        # Get (task_id, key, gpu_cached_len) stored during match_prefix
+        pending_info = self.pending_load_info.pop(last_node.id, None)
+        if pending_info is None:
+            logger.warning(f"[FlexKV] No pending info found for node {last_node.id}")
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
             )
+        
+        task_id, key, gpu_cached_len = pending_info
         
         # Check memory quota
         if mem_quota is not None and host_hit_length > mem_quota:
@@ -870,37 +878,35 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
         
+        # ===== Create new TreeNode after alloc =====
+        new_node = TreeNode()
+        start = gpu_cached_len
+        end = start + host_hit_length
+        new_node.key = key[start:end]
+        new_node.value = device_indices
+        new_node.parent = last_node
+        last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+        
+        # Update evictable_size
+        self.evictable_size_ += len(device_indices)
+        
+        # Lock new node to prevent eviction during transfer
+        self.inc_lock_ref(new_node)
+        
         # Create load operation with saved task_id (no need to re-call get_match)
         load_op = FlexKVLoadOperation(
             task_id=task_id,
             device_indices=device_indices,
-            node_id=last_node.id,
+            node_id=new_node.id,  # Use new node's id
+            node=new_node,  # Keep reference for cleanup
         )
         self.load_queue.append(load_op)
         
-        logger.debug(f"[FlexKV] init_load_back: queued {host_hit_length} tokens for node {last_node.id}, task_id={task_id}")
+        logger.debug(f"[FlexKV] init_load_back: created new node {new_node.id} with {host_hit_length} tokens, task_id={task_id}")
         
-        
-        return device_indices, last_node
+        return device_indices, new_node
     
-    def _free_load_queue_memory(self) -> None:
-        """
-        Free GPU memory allocated for pending load operations in load_queue.
-        This is called when transfer cannot proceed (worker not connected, etc.) to prevent memory leaks.
-        """
-        if not self.load_queue:
-            return
-        
-        freed_tokens = 0
-        for load_op in self.load_queue:
-            if load_op.device_indices is not None and load_op.device_indices.numel() > 0:
-                self.token_to_kv_pool_allocator.free(load_op.device_indices)
-                freed_tokens += load_op.device_indices.numel()
-        
-        if freed_tokens > 0:
-            logger.debug(f"[FlexKV] Freed {freed_tokens} tokens from cancelled load operations")
-        
-        self.load_queue.clear()
+
 
     def ready_to_load_host_cache(self) -> int:
         """
@@ -921,13 +927,13 @@ class FlexKVRadixCache(RadixCache):
             or -1 if no operations to process.
         """
         if not self.flexkv_connector._worker_connected:
-            logger.warning("[FlexKV] Worker not connected, skipping layer-by-layer transfer")
-            self._free_load_queue_memory()  # Free allocated memory to prevent leak
+            raise RuntimeError("[FlexKV] Worker not connected, skipping layer-by-layer transfer")
+            self.load_queue.clear()
             return -1
         
         if self.layer_done_counter is None:
-            logger.warning("[FlexKV] Layer done counter not available, skipping")
-            self._free_load_queue_memory()  # Free allocated memory to prevent leak
+            raise RuntimeError("[FlexKV] Layer done counter not available, skipping")
+            self.load_queue.clear()
             return -1
         
         if not self.load_queue:
@@ -939,6 +945,11 @@ class FlexKVRadixCache(RadixCache):
         # Reset event state for new transfer (marks as not finished and resets wait counter)
         self.layer_done_counter.events[producer_id].reset_for_new_transfer()
         
+        # Track nodes being loaded with their producer_id for later unlock
+        for op in self.load_queue:
+            if op.node is not None:
+                self.ongoing_load_back[op.node_id] = (op.node, producer_id)
+        
         # Launch layerwise batch transfer (rank 0 only, other ranks do nothing)
         # Pass producer_id so FlexKV knows which eventfd set to use for notification
         self.flexkv_connector.launch_layerwise_batch_transfer(self.load_queue, producer_id)
@@ -948,20 +959,6 @@ class FlexKVRadixCache(RadixCache):
         return producer_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        """
-        Cache finished request:
-        1. Insert into GPU radix tree (via super())
-        2. Store to FlexKV asynchronously
-        3. Track the node to prevent eviction during transfer
-        """
-        
-        # Periodically release completed store locks
-        try:
-            self._release_completed_store_locks()
-        except Exception:
-            pass
-        
-        # Insert into GPU radix tree
         super().cache_finished_req(req, is_insert=is_insert)
 
         if req.req_pool_idx is None:
@@ -1005,14 +1002,6 @@ class FlexKVRadixCache(RadixCache):
         logger.debug(f"[FlexKV] Locked nodes: {len(self.inflight_reqid2node)}, protected_size: {self.protected_size()}, evictable_size: {self.evictable_size()}")
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        """Cache request when it is unfinished."""
-
-        # # Periodically release completed store locks
-        # try:
-        #     self._release_completed_store_locks()
-        # except Exception:
-        #     pass
-
         if self.disable:
             return
 
@@ -1097,7 +1086,7 @@ class FlexKVRadixCache(RadixCache):
 
         # Step 1: Non-blocking poll to release completed/skimmed store locks
         try:
-            self._release_completed_store_locks()
+            self.writing_check()
         except Exception:
             pass
 
@@ -1138,7 +1127,42 @@ class FlexKVRadixCache(RadixCache):
         except Exception:
             pass
 
-    def _release_completed_store_locks(self) -> None:
+    def loading_check(self):
+        """
+        Check for completed load operations and release corresponding locks.
+        """
+        if self.layer_done_counter is None:
+            return
+        
+        if len(self.ongoing_load_back) == 0:
+            return
+        
+        completed_nodes = []
+        for node_id, (node, producer_id) in list(self.ongoing_load_back.items()):
+            # Check if the loading event for this producer_id has finished
+            event = self.layer_done_counter.events[producer_id]
+            if event._finished:
+                completed_nodes.append(node_id)
+        
+        for node_id in completed_nodes:
+            node, producer_id = self.ongoing_load_back.pop(node_id)
+            self.dec_lock_ref(node)
+            logger.debug(
+                f"[FlexKV] loading_check: released lock for node {node_id}, "
+                f"producer_id={producer_id}, key_len={len(node.key)}"
+            )
+        
+        if completed_nodes:
+            logger.debug(
+                f"[FlexKV] loading_check: released {len(completed_nodes)} load locks, "
+                f"protected_size={self.protected_size()} evictable_size={self.evictable_size()}"
+            )
+
+    def check_kv_events(self):
+        self.writing_check()
+        self.loading_check()
+
+    def writing_check(self) -> None:
         """
         Poll for completed store tasks and release corresponding locks.
         Works for both single-rank and tensor-parallel multi-rank cases.

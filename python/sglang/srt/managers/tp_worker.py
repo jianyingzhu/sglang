@@ -404,9 +404,9 @@ class TpModelWorker(BaseTpWorker):
         # now only for hicache and flexkv layer-by-layer transfer
         self.layer_transfer_counter = counter
 
-    def set_consumer(self, consumer_index: int, forward_mode: str = "unknown"):
+    def set_consumer(self, consumer_index: int):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.set_consumer(consumer_index, forward_mode)
+            self.layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
         return (
@@ -459,8 +459,7 @@ class TpModelWorker(BaseTpWorker):
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
-            forward_mode_str = model_worker_batch.forward_mode.name if model_worker_batch.forward_mode else "unknown"
-            self.set_consumer(model_worker_batch.hicache_consumer_index, forward_mode_str)
+            self.set_consumer(model_worker_batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         else:
