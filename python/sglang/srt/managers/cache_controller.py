@@ -84,8 +84,8 @@ class LayerDoneCounter:
         )
         return self.producer_index
 
-    def set_consumer(self, index: int, forward_mode: str = "unknown"):
-        logger.info(f"hicache set_consumer: index={index}, forward_mode={forward_mode}")
+    def set_consumer(self, index: int):
+        logger.info(f"hicache set_consumer: index={index}")
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
