@@ -861,8 +861,6 @@ class FlexKVRadixCache(RadixCache):
         
         return device_indices, new_node
     
-
-
     def ready_to_load_host_cache(self) -> int:
         """
         Trigger the actual layer-by-layer transfer from FlexKV to GPU.
@@ -1034,7 +1032,7 @@ class FlexKVRadixCache(RadixCache):
             for task_id in task_ids:
                 self.flexkv_connector.wait_task(task_id)
             self.flexkv_connector.inflight_taskid2reqid.clear()
-
+            
         for req_id in remaining_reqids:
             node = self.inflight_reqid2node[req_id]
             self.dec_lock_ref(node)
