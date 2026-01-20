@@ -61,11 +61,15 @@ class FlexKVLayerLoadingEvent:
         
         self._finished = True # Track if all layers are done, initially True so that first update_producer() can proceed
         self._last_layer_wait_count = 0  # Track waits on last layer (K and V each wait once)
+        # Each event has its own wait_remaining counter (need 2 waits per layer for K and V)
+        self.wait_remaining: List[int] = [2] * num_layers
 
     def reset_for_new_transfer(self):
         """Reset state for a new transfer. Called when producer starts using this event."""
         self._finished = False
         self._last_layer_wait_count = 0
+        # Reset wait counters for all layers (need 2 waits per layer for K and V)
+        self.wait_remaining = [2] * self._num_layers
 
     def wait(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -105,8 +109,6 @@ class FlexKVLayerDoneCounter:
         ]
         self.producer_index = -1
         self.consumer_index = -1
-        # Counter per layer: wait executes until count reaches 0 (need 2 waits for K and V)
-        self.wait_remaining: List[int] = [2] * num_layers
 
     def update_producer(self) -> int:
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -115,8 +117,6 @@ class FlexKVLayerDoneCounter:
         ]._finished, (
             "Producer finish event should be ready before being reused."
         )
-        # Reset wait counters for all layers for new producer (need 2 waits per layer)
-        self.wait_remaining = [2] * self.num_layers
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -125,11 +125,12 @@ class FlexKVLayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        event = self.events[self.consumer_index]
         # Wait until count reaches 0 (need 2 waits for K and V, then skip subsequent calls)
-        if self.wait_remaining[threshold] <= 0:
+        if event.wait_remaining[threshold] <= 0:
             return
-        self.wait_remaining[threshold] -= 1
-        self.events[self.consumer_index].wait(threshold)
+        event.wait_remaining[threshold] -= 1
+        event.wait(threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -226,7 +227,7 @@ class FlexKVConnector:
         
         logger.info(f"[FlexKV] Rank {self.rank}: Initialized layer transfer, sent eventfds to worker")
 
-    def _send_eventfds_to_worker(self, max_retries: int = 120, retry_interval: float = 1.0):
+    def _send_eventfds_to_worker(self, max_retries: int = 180, retry_interval: float = 1.0):
         """
         Connect to FlexKV LayerwiseTransferWorker via Unix socket and send all 3 sets of eventfds.
         
@@ -253,6 +254,7 @@ class FlexKVConnector:
                 else:
                     logger.error(f"[FlexKV] Rank {self.rank}: Failed to connect to worker after {max_retries} attempts")
                     sock.close()
+                    raise RuntimeError(f"[FlexKV] Rank {self.rank}: Failed to connect to worker after {max_retries} attempts")
                     self._worker_connected = False
                     return
         
@@ -335,6 +337,7 @@ class FlexKVConnector:
         dec_lock_ref_fn: Optional[Callable[[TreeNode], None]] = None,
     ) -> tuple[int, Optional[torch.Tensor]]:
         """
+        [Not used now]
         Start loading KV cache from FlexKV storage.
 
         Args:
@@ -607,8 +610,9 @@ class FlexKVRadixCache(RadixCache):
 
         # Load queue for pending FlexKV -> GPU transfer operations
         self.load_queue: List[FlexKVLoadOperation] = []
-        # Pending load info from match_prefix: node_id -> (token_ids, gpu_cached_len)
-        self.pending_load_info: Dict[int, tuple] = {}
+        # Pending load info from match_prefix: rid -> (task_id, key, gpu_cached_len)
+        # Use dict with rid as key to handle out-of-order or cancelled requests
+        self.pending_load_info: Dict[str, tuple] = {}
         # Track ongoing load operations: node_id -> (node, producer_id)
         self.ongoing_load_back: Dict[int, tuple] = {}
         
@@ -769,8 +773,10 @@ class FlexKVRadixCache(RadixCache):
         self.sts_flexkv_cache_len += flexkv_hit_length
 
         # Store (task_id, key, gpu_cached_len) for init_load_back (avoid re-calling get_match)
-        if flexkv_hit_length > 0:
-            self.pending_load_info[last_node.id] = (flexkv_task_id, key, value.numel())
+        # Use rid as key to support out-of-order or cancelled requests
+        rid = kwargs.get('rid')
+        if flexkv_hit_length > 0 and rid is not None:
+            self.pending_load_info[rid] = (flexkv_task_id, key, value.numel())
 
         return MatchResult(
             device_indices=value,
@@ -783,7 +789,8 @@ class FlexKVRadixCache(RadixCache):
         self,
         last_node: TreeNode,
         host_hit_length: int,
-        mem_quota: Optional[int] = None,        
+        mem_quota: Optional[int] = None,
+        rid: Optional[str] = None,
     ):
         """
         Allocate GPU memory, create new TreeNode, and add the load operation to load_queue.
@@ -793,6 +800,7 @@ class FlexKVRadixCache(RadixCache):
             last_node: The last node from match_prefix
             host_hit_length: Number of tokens hit in FlexKV storage
             mem_quota: Optional memory quota limit
+            rid: Request ID to look up pending load info
             
         Returns:
             Tuple of (device_indices tensor, updated last_node)
@@ -803,15 +811,14 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
         
-        # Get (task_id, key, gpu_cached_len) stored during match_prefix
-        pending_info = self.pending_load_info.pop(last_node.id, None)
-        if pending_info is None:
+        # Get (task_id, key, gpu_cached_len) stored during match_prefix using rid as key
+        if rid is None or rid not in self.pending_load_info:
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
             )
         
-        task_id, key, gpu_cached_len = pending_info
+        task_id, key, gpu_cached_len = self.pending_load_info.pop(rid)
         
         # Check memory quota
         if mem_quota is not None and host_hit_length > mem_quota:

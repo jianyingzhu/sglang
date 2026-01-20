@@ -769,7 +769,7 @@ class PrefillAdder:
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
+                    req.last_host_node, req.host_hit_length, rid=req.rid
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
