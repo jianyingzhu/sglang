@@ -822,6 +822,7 @@ class Req:
         if tree_cache is not None:
             match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                rid=self.rid,
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)
