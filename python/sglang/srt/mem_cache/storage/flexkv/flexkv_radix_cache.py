@@ -775,7 +775,9 @@ class FlexKVRadixCache(RadixCache):
         # Store (task_id, key, gpu_cached_len) for init_load_back (avoid re-calling get_match)
         # Use rid as key to support out-of-order or cancelled requests
         rid = kwargs.get('rid')
-        if flexkv_hit_length > 0 and rid is not None:
+        if rid is None:
+            raise ValueError("rid is required for FlexKV match_prefix")
+        if flexkv_hit_length > 0:
             self.pending_load_info[rid] = (flexkv_task_id, key, value.numel())
 
         return MatchResult(
@@ -812,7 +814,10 @@ class FlexKVRadixCache(RadixCache):
             )
         
         # Get (task_id, key, gpu_cached_len) stored during match_prefix using rid as key
-        if rid is None or rid not in self.pending_load_info:
+        if rid is None:
+            raise ValueError("rid is required for FlexKV init_load_back")
+
+        if rid not in self.pending_load_info:
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
@@ -888,8 +893,6 @@ class FlexKVRadixCache(RadixCache):
         """
         if not self.flexkv_connector._worker_connected:
             raise RuntimeError("[FlexKV] Worker not connected, skipping layer-by-layer transfer")
-            self.load_queue.clear()
-            return -1
         
         if self.layer_done_counter is None:
             raise RuntimeError("[FlexKV] Layer done counter not available, skipping")
