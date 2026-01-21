@@ -792,7 +792,7 @@ class FlexKVRadixCache(RadixCache):
         last_node: TreeNode,
         host_hit_length: int,
         mem_quota: Optional[int] = None,
-        rid: Optional[str] = None,
+        **kwargs,
     ):
         """
         Allocate GPU memory, create new TreeNode, and add the load operation to load_queue.
@@ -802,7 +802,6 @@ class FlexKVRadixCache(RadixCache):
             last_node: The last node from match_prefix
             host_hit_length: Number of tokens hit in FlexKV storage
             mem_quota: Optional memory quota limit
-            rid: Request ID to look up pending load info
             
         Returns:
             Tuple of (device_indices tensor, updated last_node)
@@ -812,7 +811,7 @@ class FlexKVRadixCache(RadixCache):
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
             )
-        
+        rid = kwargs.get('rid', None)
         # Get (task_id, key, gpu_cached_len) stored during match_prefix using rid as key
         if rid is None:
             raise ValueError("rid is required for FlexKV init_load_back")
