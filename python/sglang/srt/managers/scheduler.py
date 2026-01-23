@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import nvtx
 import psutil
 import setproctitle
 import torch
@@ -766,6 +767,7 @@ class Scheduler(
 
                 self.tree_cache = FlexKVRadixCache(
                     params=params,
+                    server_args=self.server_args,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
@@ -1840,6 +1842,10 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        # Start NVTX range for waiting stage (yellow color)
+        if not is_retracted and req.nvtx_stage_range_id is None:
+            req.nvtx_stage_range_id = nvtx.start_range(f"req_{req.rid}_waiting", color="yellow")
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return

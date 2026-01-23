@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, RadixKey
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.managers.flexkv_ipc_utils import (
     eventfd,
@@ -566,6 +567,7 @@ class FlexKVRadixCache(RadixCache):
     def __init__(
         self,
         params,
+        server_args,
         model_config: Optional[ModelConfig] = None,
         tp_size: int = 1,
         rank: int = 0,
@@ -921,7 +923,7 @@ class FlexKVRadixCache(RadixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         super().cache_finished_req(req, is_insert=is_insert)
 
-        if req.req_pool_idx is None:
+        if req.req_pool_idx is None and not is_insert:
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
@@ -946,73 +948,34 @@ class FlexKVRadixCache(RadixCache):
 
         if req.req_pool_idx in self.inflight_reqid2node:
             self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
-            del self.inflight_reqid2node[req.req_pool_idx]
 
         self.inflight_reqid2node[req.req_pool_idx] = new_last_node
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        if self.disable:
-            return
+        """Cache request when it is unfinished."""
+        super().cache_unfinished_req(req, chunked=chunked)
 
-        token_ids = req.fill_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        # token_ids = req.fill_ids
+        # kv_indices = self.req_to_token_pool.req_to_token[
+        #     req.req_pool_idx, : len(token_ids)
+        # ]
 
-        if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                dtype=torch.int64, copy=True
-            )
-        else:
-            page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-        page_aligned_token_ids = token_ids[:page_aligned_len]
+        # new_last_node = req.last_node
+        # self.inc_lock_ref(new_last_node)
+        # try:
+        #     task_id = self.flexkv_connector.store_kv_async(
+        #         token_ids=token_ids,
+        #         kv_indices=kv_indices,
+        #         req_id=req.req_pool_idx,
+        #     )
+        # except Exception as e:
+        #     logger.error(f"[FlexKV] Failed to store KV: {e}")
+        #     return
 
-        new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key), page_aligned_kv_indices, chunked=chunked
-        )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        # if req.req_pool_idx in self.inflight_reqid2node:
+        #     self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
 
-        match_res = super().match_prefix(RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key))
-        new_indices = match_res.device_indices
-        new_last_node = match_res.last_device_node
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices[len(req.prefix_indices) :],
-        )
-
-        req.cache_protected_len = len(new_indices)
-
-        self.dec_lock_ref(req.last_node)
-        self.inc_lock_ref(new_last_node)
-
-        if self.page_size != 1:
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
-            )
-        else:
-            req.prefix_indices = new_indices
-        req.last_node = new_last_node
-
-        self.inc_lock_ref(new_last_node)
-        try:
-            task_id = self.flexkv_connector.store_kv_async(
-                token_ids=page_aligned_token_ids,
-                kv_indices=page_aligned_kv_indices,
-                req_id=req.req_pool_idx,
-            )
-        except Exception as e:
-            logger.error(f"[FlexKV] Failed to store KV: {e}")
-            return
-
-        if req.req_pool_idx in self.inflight_reqid2node:
-            self.dec_lock_ref(self.inflight_reqid2node[req.req_pool_idx])
-            del self.inflight_reqid2node[req.req_pool_idx]
-
-        self.inflight_reqid2node[req.req_pool_idx] = new_last_node
+        # self.inflight_reqid2node[req.req_pool_idx] = new_last_node
 
     def evict(self, num_tokens: int) -> None:
         """
