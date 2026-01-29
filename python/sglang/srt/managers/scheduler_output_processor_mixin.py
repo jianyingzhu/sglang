@@ -4,6 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import nvtx
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -115,9 +116,17 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
+                        # End NVTX prefill range (request finished during prefill)
+                        if req.nvtx_stage_range_id is not None:
+                            nvtx.end_range(req.nvtx_stage_range_id)
+                            req.nvtx_stage_range_id = None
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+                        # End prefill stage, start decode stage (green color)
+                        if req.nvtx_stage_range_id is not None:
+                            nvtx.end_range(req.nvtx_stage_range_id)
+                        req.nvtx_stage_range_id = nvtx.start_range(f"req_{req.rid}_decode", color="green")
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -375,6 +384,11 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+
+                # End NVTX decode range (request finished)
+                if req.nvtx_stage_range_id is not None:
+                    nvtx.end_range(req.nvtx_stage_range_id)
+                    req.nvtx_stage_range_id = None
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding

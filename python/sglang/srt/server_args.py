@@ -667,6 +667,8 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+        # Handle FlexKV settings.
+        self._handle_flexkv()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -1930,6 +1932,19 @@ class ServerArgs:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
+
+    def _handle_flexkv(self):
+        if self.enable_flexkv:
+            # fix for the compatibility issue with FlashAttention3 decoding and FlexKV
+            if self.decode_attention_backend is None:
+                if not self.use_mla_backend():
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    self.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
 
     def _handle_speculative_decoding(self):
         if (
