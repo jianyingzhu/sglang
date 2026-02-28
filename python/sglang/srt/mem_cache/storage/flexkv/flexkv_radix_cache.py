@@ -11,9 +11,16 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_ipc_utils import (
-    EFD_SEMAPHORE,
+from sglang.srt.mem_cache.kv_connector import (
+    BaseKVConnector,
+    LoadOperation,
+    MatchStorageResult,
+)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, RadixKey
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.managers.flexkv_ipc_utils import (
     eventfd,
     eventfd_read,
     send_fds,
@@ -397,6 +404,164 @@ class FlexKVConnector:
     def shutdown(self) -> None:
         """Shutdown FlexKV connection."""
         self.kv_manager.shutdown()
+
+
+class FlexKVConnectorAdapter(BaseKVConnector):
+    """Adapts :class:`FlexKVConnector` to the :class:`BaseKVConnector` interface
+    so it can be used with :class:`ExtRadixCache`."""
+
+    def __init__(
+        self,
+        flexkv_connector: FlexKVConnector,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        rank: int = 0,
+        tp_size: int = 1,
+    ):
+        self._c = flexkv_connector
+        self._tp_group = tp_group
+        self._rank = rank
+        self._tp_size = tp_size
+
+    # -- Query / Load --------------------------------------------------
+
+    def match_storage(
+        self,
+        token_ids: List[int],
+        token_mask: torch.Tensor,
+    ) -> MatchStorageResult:
+        hit_length = 0
+        task_id = -1
+        if self._rank == 0:
+            token_ids_np = np.array(token_ids, dtype=np.int64)
+            task_id, matched_mask = self._c.kv_manager.get_match(
+                token_ids=token_ids_np,
+                token_mask=token_mask,
+            )
+            hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+
+        if self._tp_group is not None and self._tp_size > 1:
+            payload = broadcast_pyobj(
+                [{"hit_length": hit_length, "task_id": task_id}],
+                self._rank,
+                self._tp_group,
+                src=0,
+            )[0]
+            hit_length = payload["hit_length"]
+            task_id = payload["task_id"]
+
+        return MatchStorageResult(hit_length=hit_length, task_id=task_id)
+
+    def launch_load_batch(
+        self,
+        load_ops: List[LoadOperation],
+        producer_id: int,
+    ) -> int:
+        if self._rank != 0:
+            return 0
+
+        task_ids = []
+        slot_mappings = []
+        for op in load_ops:
+            if op.task_id < 0:
+                continue
+            slot_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
+            task_ids.append(op.task_id)
+            slot_mappings.append(slot_cpu)
+
+        if task_ids:
+            self._c.kv_manager.launch(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                as_batch=True,
+                layerwise_transfer=True,
+                counter_id=producer_id,
+            )
+        return len(task_ids)
+
+    # -- Store ---------------------------------------------------------
+
+    def store_async(
+        self,
+        token_ids: List[int],
+        kv_indices: torch.Tensor,
+        req_id: int,
+    ) -> int:
+        return self._c.store_kv_async(token_ids, kv_indices, req_id)
+
+    def poll_completed_stores(self) -> List[int]:
+        completed: List[int] = []
+        skipped: List[int] = []
+        if self._rank == 0:
+            completed = self._c.poll_completed_store_tasks()
+            skipped = self._c.poll_skipped_store_tasks()
+
+        if self._tp_group is not None and self._tp_size > 1:
+            payload = (
+                {"completed": completed, "skipped": skipped}
+                if self._rank == 0
+                else None
+            )
+            payload = broadcast_pyobj(
+                [payload], self._rank, self._tp_group, src=0
+            )[0]
+            return (payload.get("completed") or []) + (payload.get("skipped") or [])
+
+        return completed + skipped
+
+    def poll_skipped_stores(self) -> List[int]:
+        # Skipped stores are already merged in poll_completed_stores
+        return []
+
+    def wait_all_inflight(self) -> None:
+        if self._rank == 0:
+            task_ids = list(self._c.inflight_taskid2reqid.keys())
+            for tid in task_ids:
+                self._c.wait_task(tid)
+            self._c.inflight_taskid2reqid.clear()
+
+    def sync_writes_for_eviction(self, num_tokens: int, radix_cache) -> List[int]:
+        completed_req_ids: List[int] = []
+        if self._rank == 0:
+            task_ids = list(self._c.inflight_taskid2reqid.keys())
+            if task_ids:
+                for tid in task_ids:
+                    self._c.wait_task(tid)
+                for tid in task_ids:
+                    req_id = self._c.inflight_taskid2reqid.pop(tid)
+                    completed_req_ids.append(req_id)
+            completed_req_ids.extend(self._c.poll_skipped_store_tasks())
+
+        if self._tp_group is not None and self._tp_size > 1:
+            payload = broadcast_pyobj(
+                [completed_req_ids], self._rank, self._tp_group, src=0
+            )[0]
+            return payload
+
+        return completed_req_ids
+
+    # -- Layer transfer ------------------------------------------------
+
+    @property
+    def layer_done_counter(self):
+        return self._c.layer_done_counter
+
+    @property
+    def worker_connected(self) -> bool:
+        return self._c._worker_connected
+
+    def register_layer_transfer_counter(self, kvcache) -> None:
+        self._c.register_layer_transfer_counter(kvcache)
+
+    # -- Lifecycle -----------------------------------------------------
+
+    def reset(self) -> None:
+        if self._rank == 0:
+            task_ids = list(self._c.inflight_taskid2reqid.keys())
+            for tid in task_ids:
+                self._c.wait_task(tid)
+
+    def shutdown(self) -> None:
+        self._c.shutdown()
 
 
 class FlexKVRadixCache(RadixCache):

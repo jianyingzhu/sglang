@@ -827,21 +827,51 @@ class Scheduler(
                     tp_group=self.tp_group,
                 )
             elif server_args.enable_flexkv:
+                from sglang.srt.mem_cache.ext_radix_cache import ExtRadixCache
                 from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
-                    FlexKVRadixCache,
+                    FlexKVConnector,
+                    FlexKVConnectorAdapter,
                 )
 
-                self.tree_cache = FlexKVRadixCache(
-                    params=params,
-                    server_args=self.server_args,
-                    model_config=self.model_config,
+                tp_group_for_flexkv = (
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                )
+                kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+                flexkv_conn = FlexKVConnector(
+                    sgl_config=self.model_config,
+                    page_size=params.page_size,
                     tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                    tp_group=tp_group_for_flexkv,
+                    k_pool=getattr(
+                        kvcache,
+                        "k_buffer",
+                        getattr(
+                            params.token_to_kv_pool_allocator._kvcache,
+                            "k_buffer",
+                        ),
+                    ),
+                    v_pool=getattr(
+                        kvcache,
+                        "v_buffer",
+                        getattr(
+                            params.token_to_kv_pool_allocator._kvcache,
+                            "v_buffer",
+                        ),
+                    ),
+                )
+                connector = FlexKVConnectorAdapter(
+                    flexkv_connector=flexkv_conn,
+                    tp_group=tp_group_for_flexkv,
                     rank=self.tp_rank,
-                    tp_group=(
-                        self.attn_tp_cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
-                    ), # self.tp_group,
+                    tp_size=self.tp_size,
+                )
+                connector.register_layer_transfer_counter(kvcache)
+                self.tree_cache = ExtRadixCache(
+                    params=params,
+                    connector=connector,
                 )
                 self.tp_worker.register_layer_transfer_counter(
                     self.tree_cache.layer_done_counter

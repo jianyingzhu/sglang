@@ -712,6 +712,24 @@ class RadixCache(BasePrefixCache):
             self._record_store_event(new_node)
         return total_prefix_length
 
+    def insert_node_with_value(
+        self, parent: TreeNode, key: RadixKey, value: torch.Tensor
+    ) -> TreeNode:
+        """Insert a new leaf node with a pre-allocated GPU value tensor.
+
+        This is used by ExtRadixCache to materialise nodes for data loaded
+        from an external KV connector without touching tree internals
+        directly.
+        """
+        new_node = TreeNode()
+        new_node.key = key
+        new_node.value = value
+        new_node.parent = parent
+        parent.children[self.get_child_key_fn(key)] = new_node
+        self.evictable_size_ += len(value)
+        self._record_store_event(new_node)
+        return new_node
+
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
