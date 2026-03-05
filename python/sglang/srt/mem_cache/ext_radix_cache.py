@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -24,7 +24,6 @@ class ExtRadixCache(BasePrefixCache):
     ``RadixCache``.  When a ``BaseKVConnector`` is supplied, additional
     storage-level match / load / store logic is layered on top.
     """
-
     def __init__(
         self,
         params: CacheInitParams,
@@ -33,14 +32,10 @@ class ExtRadixCache(BasePrefixCache):
         self._radix = RadixCache(params)
         self._connector = connector
 
-        self._inflight_reqid2node: Dict[int, TreeNode] = {}
-        self._pending_load_info: Dict[str, tuple] = {}
+        self._load_task_id_counter = 0
         self._load_queue: List[LoadOperation] = []
-        self._ongoing_load_back: Dict[int, Tuple[TreeNode, int]] = {}
-
-    # ------------------------------------------------------------------
-    # PrefixCacheTrait attributes – delegate to inner RadixCache
-    # ------------------------------------------------------------------
+        self._ongoing_load_tasks: Dict[int, List[TreeNode]] = {}
+        self._ongoing_store_tasks: Dict[int, TreeNode] = {}
 
     @property
     def req_to_token_pool(self):
@@ -70,32 +65,18 @@ class ExtRadixCache(BasePrefixCache):
     def metrics_collector(self, value):
         self._radix.metrics_collector = value
 
-    # ------------------------------------------------------------------
-    # Layer transfer property – exposed for scheduler
-    # ------------------------------------------------------------------
-
     @property
     def layer_done_counter(self):
         if self._connector is None:
             return None
         return self._connector.layer_done_counter
 
-    # ------------------------------------------------------------------
-    # Pure delegation (behaviour identical to RadixCache)
-    # ------------------------------------------------------------------
-
     def reset(self):
+        self._ongoing_store_tasks.clear()
+        self._ongoing_load_tasks.clear()
+        self._load_queue.clear()
+
         if self._connector is not None:
-            for _, node in self._inflight_reqid2node.items():
-                self._radix.dec_lock_ref(node)
-            self._inflight_reqid2node.clear()
-
-            for _, (node, _) in self._ongoing_load_back.items():
-                self._radix.dec_lock_ref(node)
-            self._ongoing_load_back.clear()
-
-            self._load_queue.clear()
-            self._pending_load_info.clear()
             self._connector.reset()
 
         self._radix.reset()
@@ -130,65 +111,52 @@ class ExtRadixCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, **kwargs):
         return self._radix.cache_unfinished_req(req, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Extended methods (connector-aware)
-    # ------------------------------------------------------------------
-
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
-        base_res = self._radix.match_prefix(key, **kwargs)
+        device_match_result = self._radix.match_prefix(key, **kwargs)
         if self._connector is None:
-            return base_res
+            return device_match_result
 
-        value: torch.Tensor = base_res.device_indices
-        last_node = base_res.last_device_node
+        device_indices: torch.Tensor = device_match_result.device_indices
+        last_device_node = device_match_result.last_device_node
 
-        uncached_len = len(key) - value.numel()
+        uncached_len = len(key) - device_indices.numel()
         if uncached_len <= 0:
-            return base_res
+            return device_match_result
 
         token_mask = torch.zeros(len(key), dtype=torch.bool)
-        token_mask[value.numel():] = True
+        token_mask[device_indices.numel():] = True
 
-        storage_res = self._connector.match_storage(
+        update_connector_state = kwargs.get("update_connector_state", False)
+        rid = kwargs.get("rid", None)
+
+        new_hit_length = self._connector.get_new_hit_length(
             token_ids=key.token_ids,
             token_mask=token_mask,
+            update_state_for_load=update_connector_state,
+            rid=rid,
         )
 
-        rid = kwargs.get("rid")
-        if storage_res.hit_length > 0 and rid is not None:
-            self._pending_load_info[rid] = (
-                storage_res.task_id,
-                key,
-                value.numel(),
-            )
-
         return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-            host_hit_length=storage_res.hit_length,
+            device_indices=device_indices,
+            last_device_node=last_device_node,
+            last_host_node=last_device_node,
+            host_hit_length=new_hit_length,
         )
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
+        req: Req,
         mem_quota: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Any]:
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
+    ) -> None:
+        if self._connector is None:
+            return
+        
+        host_hit_length = req.host_hit_length
 
-        if self._connector is None or host_hit_length <= 0:
-            return empty, last_node
-
-        rid = kwargs.get("rid")
-        if rid is None or rid not in self._pending_load_info:
-            return empty, last_node
-
-        task_id, key, gpu_cached_len = self._pending_load_info.pop(rid)
-
-        if mem_quota is not None and host_hit_length > mem_quota:
-            return empty, last_node
+        if host_hit_length <= 0 or (mem_quota is not None and host_hit_length > mem_quota):
+            self._connector.cancel_load_task(req.rid)
+            return
 
         device_indices = self._radix.token_to_kv_pool_allocator.alloc(
             host_hit_length
@@ -203,140 +171,114 @@ class ExtRadixCache(BasePrefixCache):
                 "Failed to allocate %d GPU slots for external load",
                 host_hit_length,
             )
-            return empty, last_node
+            self._connector.cancel_load_task(req.rid)
+            return
 
-        start = gpu_cached_len
-        end = start + host_hit_length
-        new_node = self._radix.insert_node_with_value(
-            parent=last_node,
-            key=key[start:end],
-            value=device_indices,
+        gpu_cached_len = len(req.prefix_indices)
+        key = RadixKey(
+            token_ids=req.fill_ids[gpu_cached_len : gpu_cached_len + host_hit_length],
+            extra_key=req.extra_key,
         )
+
+        last_node = req.last_node
+        new_node = TreeNode()
+        new_node.key = key
+        new_node.value = device_indices
+        new_node.parent = last_node
+        last_node.children[self._radix.get_child_key_fn(new_node.key)] = new_node
+        self._radix.evictable_size_ += len(device_indices)
+        self._radix._record_store_event(new_node)
 
         self._radix.inc_lock_ref(new_node)
 
         self._load_queue.append(
             LoadOperation(
-                task_id=task_id,
+                rid=req.rid,
                 device_indices=device_indices,
-                tag=(new_node.id, new_node),
+                node=new_node,
             )
         )
 
-        return device_indices, new_node
+        req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
+        req.last_node = new_node
 
     def ready_to_load_host_cache(self) -> int:
-        if self._connector is None:
+        if self._connector is None or not self._load_queue:
             return -1
 
-        if not self._connector.worker_connected:
-            raise RuntimeError(
-                "External KV connector worker not connected"
-            )
+        task_id = self._load_task_id_counter
+        self._load_task_id_counter += 1
 
-        counter = self._connector.layer_done_counter
-        if counter is None:
-            raise RuntimeError("Layer done counter not available")
+        self._connector.start_load_kv(task_id, self._load_queue)
 
-        if not self._load_queue:
-            return -1
+        nodes = [op.node for op in self._load_queue]
+        self._ongoing_load_tasks[task_id] = nodes
 
-        producer_id = counter.update_producer()
-        counter.events[producer_id].reset_for_new_transfer()
-
-        for op in self._load_queue:
-            node_id, node = op.tag
-            self._ongoing_load_back[node_id] = (node, producer_id)
-
-        self._connector.launch_load_batch(self._load_queue, producer_id)
         self._load_queue.clear()
-
-        return producer_id
+        return task_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         self._radix.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
-        if self._connector is None:
+        if self._connector is None or not is_insert:
             return
 
-        if req.req_pool_idx is None and not is_insert:
-            return
-
+        req_id = req.req_pool_idx
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         kv_indices = self._radix.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req_id, : len(token_ids)
         ]
-
-        new_last_node = req.last_node
-        if new_last_node is None:
-            return
         
-        self._connector.store_kv_async(
+        task_id = self._load_task_id_counter
+        self._load_task_id_counter += 1
+
+        self._connector.start_store_kv(
+            task_id=task_id,
             token_ids=token_ids,
             kv_indices=kv_indices,
-            req_id=req.req_pool_idx,
         )
 
-        if req.req_pool_idx in self._inflight_reqid2node:
-            self._radix.dec_lock_ref(
-                self._inflight_reqid2node[req.req_pool_idx]
-            )
-
-        self._radix.inc_lock_ref(new_last_node)
-        self._inflight_reqid2node[req.req_pool_idx] = new_last_node
+        self._radix.inc_lock_ref(req.last_node)
+        self._ongoing_store_tasks[task_id] = req.last_node
 
     def evict(self, num_tokens: int):
         if self._radix.disable:
             return
-
-        if self._connector is not None:
-            if num_tokens > self._radix.evictable_size():
-                completed_ids = self._connector.sync_writes_for_eviction(num_tokens, self._radix)
-                for req_id in completed_ids:
-                    node = self._inflight_reqid2node.pop(req_id, None)
-                    if node is not None:
-                        self._radix.dec_lock_ref(node)
-
         self._radix.evict(num_tokens)
 
     def check_kv_events(self):
         if self._connector is None:
             return
-        self._writing_check()
-        self._loading_check()
+        self._check_store_completion()
+        self._check_load_completion()
 
     def prefetch(self, req: Req) -> None:
-        return
+        if self._connector is None:
+            return
+        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        self._connector.prefetch(req.rid, token_ids)
 
     def can_be_scheduled(self, req: Req) -> bool:
-        return True
+        if self._connector is None:
+            return True
+        return self._connector.check_prefetch_completed(req.rid)
 
     def release_aborted_request(self, req: Req) -> None:
-        return
+        if self._connector is None:
+            return
+        self._connector.cancel_prefetch(req.rid)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _writing_check(self) -> None:
-        completed = self._connector.poll_completed_stores()
-        skipped = self._connector.poll_skipped_stores()
-        for req_id in completed + skipped:
-            node = self._inflight_reqid2node.pop(req_id, None)
+    def _check_store_completion(self) -> None:
+        completed_ids = self._connector.check_completed_store_tasks()
+        for task_id in completed_ids:
+            node = self._ongoing_store_tasks.pop(task_id, None)
             if node is not None:
                 self._radix.dec_lock_ref(node)
 
-    def _loading_check(self) -> None:
-        counter = self._connector.layer_done_counter
-        if counter is None or not self._ongoing_load_back:
-            return
-
-        completed_ids = []
-        for node_id, (node, producer_id) in self._ongoing_load_back.items():
-            event = counter.events[producer_id]
-            if event._finished:
-                completed_ids.append(node_id)
-
-        for node_id in completed_ids:
-            node, _ = self._ongoing_load_back.pop(node_id)
-            self._radix.dec_lock_ref(node)
+    def _check_load_completion(self) -> None:
+        completed_ids = self._connector.check_completed_load_tasks()
+        for task_id in completed_ids:
+            nodes = self._ongoing_load_tasks.pop(task_id, None)
+            if nodes is not None:
+                for node in nodes:
+                    self._radix.dec_lock_ref(node)

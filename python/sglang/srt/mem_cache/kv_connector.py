@@ -6,19 +6,10 @@ from typing import Any, List, NamedTuple, Optional
 import torch
 
 
-class MatchStorageResult(NamedTuple):
-    """Result of querying external KV storage for cached tokens."""
-
-    hit_length: int
-    task_id: int  # -1 if no match or not applicable
-
-
 class LoadOperation(NamedTuple):
-    """A pending load operation from external storage to GPU."""
-
-    task_id: int
+    rid: str
     device_indices: torch.Tensor
-    tag: Any  # opaque tag for the caller to track (e.g. node_id)
+    node: Any
 
 
 class BaseKVConnector(ABC):
@@ -34,32 +25,64 @@ class BaseKVConnector(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def match_storage(
+    def get_new_hit_length(
         self,
         token_ids: List[int],
         token_mask: torch.Tensor,
-    ) -> MatchStorageResult:
+        update_state_for_load: bool = False,
+        rid: Optional[str] = None,
+    ) -> int:
         """Check how many tokens are available in external storage.
 
         Args:
             token_ids: Full token id sequence.
             token_mask: Boolean mask – True for positions to check.
+            update_state_for_load: If True, the connector should lock internal
+                state so that the query result remains valid until the
+                corresponding load is started or cancelled.
+            rid: Request id used to track the subsequent load task.
 
         Returns:
-            MatchStorageResult with hit_length and task_id for later load.
+            int: The number of new matched tokens.
         """
         ...
 
     @abstractmethod
-    def launch_load_batch(
+    def cancel_load_task(self, rid: str) -> None:
+        """Cancel a previously locked load for the given request.
+
+        Called when GPU memory allocation fails or the load exceeds the
+        memory quota.  Releases the lock acquired by
+        :meth:`get_new_hit_length` with ``update_state_for_load=True``.
+
+        Args:
+            rid: Request id previously passed to :meth:`get_new_hit_length`.
+        """
+        ...
+
+    @abstractmethod
+    def start_load_kv(
         self,
+        task_id: int,
         load_ops: List[LoadOperation],
-        producer_id: int,
-    ) -> int:
-        """Launch a batch of load operations (layer-by-layer transfer).
+    ) -> None:
+        """Start a batch of load operations from external storage to GPU.
+
+        The connector handles readiness checks, producer allocation, event
+        management, and the actual launch internally.
+
+        Args:
+            task_id: Caller-assigned task id for completion tracking.
+            load_ops: Pending load operations to execute.
+        """
+        ...
+
+    @abstractmethod
+    def check_completed_load_tasks(self) -> List[int]:
+        """Check if any load tasks have completed.
 
         Returns:
-            Number of operations actually launched.
+            List of load task_ids whose tasks have completed.
         """
         ...
 
@@ -68,50 +91,55 @@ class BaseKVConnector(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def store_kv_async(
+    def start_store_kv(
         self,
+        task_id: int,
         token_ids: List[int],
         kv_indices: torch.Tensor,
-        req_id: int,
-    ) -> int:
+    ) -> None:
         """Asynchronously store KV cache for *token_ids* at *kv_indices*.
 
-        Returns:
-            task_id (>= 0) if a real task was launched, -1 otherwise.
+        Args:
+            task_id: Caller-assigned task id for completion tracking.
         """
         ...
 
     @abstractmethod
-    def poll_completed_stores(self) -> List[int]:
-        """Non-blocking poll returning req_ids whose stores completed."""
-        ...
-
-    @abstractmethod
-    def poll_skipped_stores(self) -> List[int]:
-        """Non-blocking poll returning req_ids whose stores were skipped."""
-        ...
-
-    @abstractmethod
-    def wait_all_inflight(self) -> None:
-        """Block until every in-flight store finishes."""
-        ...
-
-    @abstractmethod
-    def sync_writes_for_eviction(self, num_tokens: int, radix_cache: Any) -> List[int]:
-        """Synchronize in-flight store operations for eviction.
-
-        Called when GPU eviction alone cannot free enough tokens.  The connector
-        should try to complete enough writes to unlock at least *num_tokens*
-        worth of cache entries.  The concrete strategy (poll, block, partial
-        wait, etc.) is entirely up to the implementation.
-
-        Args:
-            num_tokens: Number of tokens that still need to be freed.
-            radix_cache: The RadixCache instance, can be used to query
-                evictable_size() during synchronization.
+    def check_completed_store_tasks(self) -> List[int]:
+        """Check if any store tasks have completed.
 
         Returns:
-            List of req_ids whose stores have completed.
+            List of store task_ids whose tasks have completed.
+        """
+        ...
+
+    @abstractmethod
+    def prefetch(self, rid: str, token_ids: List[int]) -> None:
+        """Start prefetching KV cache from external storage for a request.
+
+        Args:
+            rid: Request id.
+            token_ids: Token id sequence to prefetch.
+        """
+        ...
+
+    @abstractmethod
+    def check_prefetch_completed(self, rid: str) -> bool:
+        """Check if the prefetch for the given request has completed.
+
+        Returns:
+            True if complete or no prefetch was needed.
+        """
+        ...
+
+    @abstractmethod
+    def cancel_prefetch(self, rid: str) -> None:
+        """Cancel an in-progress or pending prefetch for the given request.
+
+        Called when the request is aborted while waiting in the queue.
+
+        Args:
+            rid: Request id previously passed to :meth:`prefetch`.
         """
         ...
 
@@ -125,20 +153,10 @@ class BaseKVConnector(ABC):
         """Return the layer-wise transfer counter, or None."""
         ...
 
-    @property
-    @abstractmethod
-    def worker_connected(self) -> bool:
-        """Whether the layer-wise transfer worker is connected."""
-        ...
-
     @abstractmethod
     def register_layer_transfer_counter(self, kvcache: Any) -> None:
         """Register the layer transfer counter with the KV cache pool."""
         ...
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def reset(self) -> None:
         """Reset connector state (called on cache reset)."""

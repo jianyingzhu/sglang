@@ -451,7 +451,30 @@ class FlexKVConnectorAdapter(BaseKVConnector):
 
         return MatchStorageResult(hit_length=hit_length, task_id=task_id)
 
-    def launch_load_batch(
+    def start_load_transfer(
+        self,
+        load_ops: List[LoadOperation],
+    ) -> int:
+        if not self._c._worker_connected:
+            raise RuntimeError("FlexKV worker not connected")
+
+        counter = self._c.layer_done_counter
+        if counter is None:
+            raise RuntimeError("Layer done counter not available")
+
+        producer_id = counter.update_producer()
+        counter.events[producer_id].reset_for_new_transfer()
+
+        self._launch_load_batch(load_ops, producer_id)
+        return producer_id
+
+    def is_load_complete(self, tracking_token: int) -> bool:
+        counter = self._c.layer_done_counter
+        if counter is None:
+            return True
+        return counter.events[tracking_token]._finished
+
+    def _launch_load_batch(
         self,
         load_ops: List[LoadOperation],
         producer_id: int,
@@ -462,10 +485,10 @@ class FlexKVConnectorAdapter(BaseKVConnector):
         task_ids = []
         slot_mappings = []
         for op in load_ops:
-            if op.task_id < 0:
+            if op.rid < 0:
                 continue
             slot_cpu = op.device_indices.cpu() if op.device_indices.is_cuda else op.device_indices
-            task_ids.append(op.task_id)
+            task_ids.append(op.rid)
             slot_mappings.append(slot_cpu)
 
         if task_ids:
@@ -544,10 +567,6 @@ class FlexKVConnectorAdapter(BaseKVConnector):
     @property
     def layer_done_counter(self):
         return self._c.layer_done_counter
-
-    @property
-    def worker_connected(self) -> bool:
-        return self._c._worker_connected
 
     def register_layer_transfer_counter(self, kvcache) -> None:
         self._c.register_layer_transfer_counter(kvcache)
@@ -693,8 +712,7 @@ class FlexKVRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
+        req,
         mem_quota: Optional[int] = None,
         **kwargs,
     ):
@@ -702,44 +720,26 @@ class FlexKVRadixCache(RadixCache):
         Allocate GPU memory, create new TreeNode, and add the load operation to load_queue.
         """
         if host_hit_length <= 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
-        rid = kwargs.get('rid', None)
-        # Get (task_id, key, gpu_cached_len) stored during match_prefix using rid as key
-        if rid is None:
-            raise ValueError("rid is required for FlexKV init_load_back")
+            return
+        rid = req.rid
 
         if rid not in self.pending_load_info:
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return
         
         task_id, key, gpu_cached_len = self.pending_load_info.pop(rid)
         
-        # Check memory quota
         if mem_quota is not None and host_hit_length > mem_quota:
             logger.debug(f"[FlexKV] host_hit_length {host_hit_length} exceeds mem_quota {mem_quota}, skipping load")
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return
         
-        # Allocate GPU memory for the tokens to load
         device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
         if device_indices is None:
-            # Try eviction and retry
             self.evict(host_hit_length)
             device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
         
         if device_indices is None:
             logger.warning(f"[FlexKV] Failed to allocate {host_hit_length} GPU slots for load")
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return
         
         #Create new TreeNode after alloc
         new_node = TreeNode()
@@ -765,7 +765,8 @@ class FlexKVRadixCache(RadixCache):
         )
         self.load_queue.append(load_op)
         
-        return device_indices, new_node
+        req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
+        req.last_node = new_node
     
     def ready_to_load_host_cache(self) -> int:
         """
