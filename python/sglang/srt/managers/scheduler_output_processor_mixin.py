@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import nvtx
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode

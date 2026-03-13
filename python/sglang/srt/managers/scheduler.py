@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-import nvtx
 import psutil
 import setproctitle
 import torch
