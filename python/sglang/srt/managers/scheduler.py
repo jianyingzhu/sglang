@@ -1841,10 +1841,6 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-        # Start NVTX range for waiting stage (yellow color)
-        if not is_retracted and req.nvtx_stage_range_id is None:
-            req.nvtx_stage_range_id = nvtx.start_range(f"req_{req.rid}_waiting", color="yellow")
-
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -2135,9 +2131,6 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-
-        if ret:
-            trace_event_batch("schedule", ret.reqs)
 
         return ret
 
@@ -3309,9 +3302,6 @@ def configure_scheduler(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
     prefix = ""
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:

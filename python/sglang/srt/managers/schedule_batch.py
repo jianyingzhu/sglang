@@ -659,9 +659,6 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
-        # NVTX range id for profiling request lifecycle stages
-        self.nvtx_stage_range_id = None
-
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0

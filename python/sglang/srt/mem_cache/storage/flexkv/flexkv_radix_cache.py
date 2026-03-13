@@ -10,7 +10,12 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_ipc_utils import (
     EFD_SEMAPHORE,
@@ -466,18 +471,20 @@ class FlexKVRadixCache(RadixCache):
         self.load_queue.clear()
         self.pending_load_info.clear()       
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match prefix against GPU cache and query FlexKV for uncached tokens."""
+        key = params.key
         self.sts_total_seq_len += len(key)
         if self.disable or not key:
-            return super().match_prefix(key, **kwargs)
+            return super().match_prefix(params)
 
         if self.page_size != 1:
             aligned_len = len(key) // self.page_size * self.page_size
             key = key[:aligned_len]
+            params = MatchPrefixParams(key=key, req=params.req, cow_mamba=params.cow_mamba)
 
         # First, match against GPU radix cache
-        base_res = super().match_prefix(key, **kwargs)
+        base_res = super().match_prefix(params)
         value: torch.Tensor = base_res.device_indices
         self.sts_gpu_cache_len += value.numel()
 
@@ -512,10 +519,10 @@ class FlexKVRadixCache(RadixCache):
 
         self.sts_flexkv_cache_len += flexkv_hit_length
 
-        # Store pending load info for init_load_back
-        rid = kwargs.get('rid')
+        # Store pending load info for init_load_back, keyed by req.rid
+        rid = params.req.rid if params.req is not None else None
         if rid is None:
-            raise ValueError("rid is required for FlexKV match_prefix")
+            raise ValueError("req.rid is required for FlexKV match_prefix")
         if flexkv_hit_length > 0:
             self.pending_load_info[rid] = (flexkv_task_id, key, value.numel())
 
@@ -566,7 +573,7 @@ class FlexKVRadixCache(RadixCache):
         device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
         if device_indices is None:
             # Try eviction and retry
-            self.evict(host_hit_length)
+            self.evict(EvictParams(num_tokens=host_hit_length))
             device_indices = self.token_to_kv_pool_allocator.alloc(host_hit_length)
         
         if device_indices is None:
@@ -707,13 +714,15 @@ class FlexKVRadixCache(RadixCache):
 
         self.inflight_reqid2node[req.req_pool_idx] = new_last_node
 
-    def evict(self, num_tokens: int) -> None:
+    def evict(self, params: EvictParams) -> EvictResult:
         """
         Try non-blocking release of completed FlexKV store tasks, evict, and only
         if insufficient tokens are freed, block-wait remaining tasks and evict again.
         """
         if self.disable:
-            return
+            return EvictResult()
+
+        num_tokens = params.num_tokens
 
         # Step 1: Non-blocking poll to release completed/skimmed store locks
         try:
@@ -722,9 +731,9 @@ class FlexKVRadixCache(RadixCache):
             pass
 
         # Step 2: Attempt eviction with currently evictable nodes
-        evicted = super().evict(num_tokens)
-        if evicted >= num_tokens:
-            return
+        result = super().evict(params)
+        if result.num_tokens_evicted >= num_tokens:
+            return result
 
         # Step 3: Not enough freed. Block-wait remaining FlexKV tasks, then release all locks and evict the rest.
         # Use tuple instead of list to avoid unnecessary copy overhead
@@ -735,15 +744,19 @@ class FlexKVRadixCache(RadixCache):
             for task_id in task_ids:
                 self.flexkv_connector.wait_task(task_id)
             self.flexkv_connector.inflight_taskid2reqid.clear()
-            
+
         for req_id in remaining_reqids:
             node = self.inflight_reqid2node[req_id]
             self.dec_lock_ref(node)
         self.inflight_reqid2node.clear()
 
-        remaining_to_evict = num_tokens - evicted
+        remaining_to_evict = num_tokens - result.num_tokens_evicted
         if remaining_to_evict > 0:
-            super().evict(remaining_to_evict)
+            extra = super().evict(EvictParams(num_tokens=remaining_to_evict))
+            return EvictResult(
+                num_tokens_evicted=result.num_tokens_evicted + extra.num_tokens_evicted
+            )
+        return result
     
     def pretty_print(self):
         super().pretty_print()
