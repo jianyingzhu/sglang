@@ -2888,12 +2888,12 @@ class ServerArgs:
                     "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
                 )
 
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
-                logger.warning(
-                    "Mixed chunked prefill is disabled because of using "
-                    "eagle speculative decoding."
-                )
+            # if self.enable_mixed_chunk:
+            #     self.enable_mixed_chunk = False
+            #     logger.warning(
+            #         "Mixed chunked prefill is disabled because of using "
+            #         "eagle speculative decoding."
+            #     )
 
             model_arch = self.get_model_config().hf_config.architectures[0]
             if model_arch in [
@@ -5889,10 +5889,10 @@ class ServerArgs:
         self.check_lora_server_args()
 
         # Check speculative decoding
-        if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+        # if self.speculative_algorithm is not None:
+        #     assert (
+        #         not self.enable_mixed_chunk
+        #     ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
