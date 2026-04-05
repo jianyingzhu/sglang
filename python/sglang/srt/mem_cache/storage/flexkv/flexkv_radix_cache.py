@@ -450,6 +450,7 @@ class FlexKVRadixCache(RadixCache):
         self.load_queue: List[FlexKVLoadOperation] = []
         self.pending_load_info: Dict[str, tuple] = {}  # rid -> (task_id, key, gpu_cached_len)
         self.ongoing_load_back: Dict[int, tuple] = {}  # node_id -> (node, producer_id)
+        self._load_fkv_tids: List[int] = []  # periodically drained to prevent pipe deadlock
 
         super().__init__(params)
 
@@ -469,7 +470,8 @@ class FlexKVRadixCache(RadixCache):
         self.ongoing_load_back.clear()
 
         self.load_queue.clear()
-        self.pending_load_info.clear()       
+        self.pending_load_info.clear()
+        self._load_fkv_tids.clear()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match prefix against GPU cache and query FlexKV for uncached tokens."""
@@ -652,7 +654,13 @@ class FlexKVRadixCache(RadixCache):
             
             # Launch layerwise batch transfer (rank 0 only, other ranks do nothing)
             self.flexkv_connector.launch_layerwise_batch_transfer(self.load_queue, producer_id)
-            
+
+            # Collect task IDs for periodic pipe draining
+            if self.rank == 0:
+                self._load_fkv_tids.extend(
+                    op.task_id for op in self.load_queue if op.task_id >= 0
+                )
+
             self.load_queue.clear()
             
             return producer_id
@@ -768,6 +776,12 @@ class FlexKVRadixCache(RadixCache):
         """
         Check for completed load operations and release corresponding locks.
         """
+        # Periodically drain the completion pipe to prevent CompletedOp accumulation
+        # causing pipe write-side blocking (deadlock).
+        if self.rank == 0 and len(self._load_fkv_tids) >= 100:
+            self.flexkv_connector.kv_manager.try_wait(task_ids=self._load_fkv_tids)
+            self._load_fkv_tids.clear()
+
         if len(self.ongoing_load_back) == 0:
             return
         
