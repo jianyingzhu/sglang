@@ -1193,6 +1193,8 @@ class Qwen3NextForCausalLM(nn.Module):
                     ) and replaced_name not in params_dict:
                         continue
                     name = replaced_name
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
 
                     weight_loader = getattr(param, "weight_loader")
@@ -1215,6 +1217,8 @@ class Qwen3NextForCausalLM(nn.Module):
                         assert (
                             abs(loaded_weight.item() - 1.0) < 1e-6
                         ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        continue
+                    if name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(

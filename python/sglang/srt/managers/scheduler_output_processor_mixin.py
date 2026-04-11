@@ -163,6 +163,19 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # For spec decode v1, decode reqs in a MIXED batch have their
+                # output_ids and finish-state managed by verify() inside the
+                # spec decode cycle. Appending a token here would insert a
+                # spurious token that de-syncs output_ids from seq_lens and
+                # the KV cache, corrupting the next spec decode cycle.
+                if (
+                    not batch.spec_algorithm.is_none()
+                    and not batch.is_spec_v2
+                    and batch.decoding_reqs is not None
+                    and req in batch.decoding_reqs
+                ):
+                    continue
+
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 

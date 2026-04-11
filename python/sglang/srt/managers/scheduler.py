@@ -176,7 +176,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import get_last_loc, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -2355,6 +2355,24 @@ class Scheduler(
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
+                if not self.spec_algorithm.is_none():
+                    # For spec decoding, prepare_for_decode() returns early
+                    # without setting input_ids (to 1 token/req) or out_cache_loc.
+                    # After the verify step, running_batch.input_ids holds all
+                    # accepted tokens (potentially >1 per req), which would cause
+                    # a shape mismatch in mix_with_running (which assumes 1 token
+                    # per decode request). Fix by using only the last accepted token
+                    # and the already-allocated KV slot at position seq_len-1.
+                    self.running_batch.input_ids = torch.tensor(
+                        [req.output_ids[-1] for req in self.running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.running_batch.seq_lens.device,
+                    )
+                    self.running_batch.out_cache_loc = get_last_loc(
+                        self.running_batch.req_to_token_pool.req_to_token,
+                        self.running_batch.req_pool_indices,
+                        self.running_batch.seq_lens,
+                    )
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
