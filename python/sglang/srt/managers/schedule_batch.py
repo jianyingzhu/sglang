@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    get_last_loc,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1942,6 +1943,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in running_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
+
+        # For spec decode, prepare_for_decode() returns early without setting
+        # input_ids or out_cache_loc. Fix up here so every decode req contributes
+        # exactly 1 token (the last accepted token) and a valid KV slot.
+        if running_batch.input_ids is None or len(running_batch.input_ids) != running_bs:
+            running_batch.input_ids = torch.tensor(
+                [req.output_ids[-1] for req in running_batch.reqs],
+                dtype=torch.int64,
+                device=running_batch.seq_lens.device,
+            )
+            running_batch.out_cache_loc = get_last_loc(
+                running_batch.req_to_token_pool.req_to_token,
+                running_batch.req_pool_indices,
+                running_batch.seq_lens,
+            )
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
