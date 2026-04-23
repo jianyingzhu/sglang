@@ -1396,6 +1396,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
+    decode_spec_info: Any = None
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
@@ -1961,6 +1962,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+
+        # Save spec_info before merge (merge_batch drops it when self.spec_info is None)
+        self.decode_spec_info = running_batch.spec_info
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids

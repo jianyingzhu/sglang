@@ -1,3 +1,4 @@
+import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -288,6 +289,18 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        # Mixed verify+extend: decode reqs do full spec decode while extend
+        # reqs do normal prefill, instead of the workaround that reduces
+        # decode reqs to 1 token and skips spec decode for a round.
+        if (
+            batch.forward_mode.is_mixed()
+            and batch.decoding_reqs
+            and not batch.spec_algorithm.is_none()
+            and batch.decode_spec_info is not None
+        ):
+            result = self.forward_mixed_verify_extend(batch)
+            return result
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             (
                 logits_output,
@@ -339,6 +352,317 @@ class EAGLEWorker(TpModelWorker):
                 accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+
+    def forward_mixed_verify_extend(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Mixed batch: decode reqs do full spec decode, extend reqs do normal prefill.
+
+        Currently uses two separate target model forwards (one for verify, one for
+        extend). A future optimisation will merge them into a single forward with
+        split attention (see design doc Phase 2).
+        """
+
+        decode_reqs = batch.decoding_reqs
+        decode_reqs_ids = set(id(r) for r in decode_reqs)
+        extend_reqs = [r for r in batch.reqs if id(r) not in decode_reqs_ids]
+        num_extend = len(extend_reqs)
+        num_decode = len(decode_reqs)
+
+        # In the mixed batch created by mix_with_running:
+        #   reqs  = [extend_reqs ..., decode_reqs ...]
+        #   input_ids = [extend_tokens ..., 1-token-per-decode-req ...]
+        num_extend_tokens = sum(batch.extend_lens[:num_extend])
+
+        # decode_spec_info is saved by mix_with_running from running_batch.spec_info,
+        # already aligned with decoding_reqs after filter_batch.
+        decode_spec_info = batch.decode_spec_info
+
+        # ===================== Save original batch state =====================
+        saved_reqs = batch.reqs[:]
+        saved_req_pool_indices = batch.req_pool_indices
+        saved_seq_lens = batch.seq_lens.clone()
+        saved_seq_lens_cpu = batch.seq_lens_cpu.clone()
+        saved_orig_seq_lens = (
+            batch.orig_seq_lens.clone()
+            if batch.orig_seq_lens is not None
+            else None
+        )
+        saved_input_ids = batch.input_ids
+        saved_out_cache_loc = batch.out_cache_loc
+        saved_forward_mode = batch.forward_mode
+        saved_extend_lens = batch.extend_lens[:]
+        saved_prefix_lens = batch.prefix_lens[:]
+        saved_extend_num_tokens = batch.extend_num_tokens
+        saved_sampling_info = batch.sampling_info
+        saved_return_logprob = batch.return_logprob
+        saved_extend_logprob_start_lens = (
+            batch.extend_logprob_start_lens[:]
+            if batch.extend_logprob_start_lens
+            else None
+        )
+        saved_top_logprobs_nums = (
+            batch.top_logprobs_nums[:]
+            if batch.top_logprobs_nums
+            else None
+        )
+        saved_token_ids_logprobs = (
+            batch.token_ids_logprobs[:]
+            if batch.token_ids_logprobs
+            else None
+        )
+        saved_is_extend_in_batch = batch.is_extend_in_batch
+        saved_has_grammar = batch.has_grammar
+        saved_has_stream = batch.has_stream
+
+        # ==================== Phase 1: Decode (draft → verify → draft_extend) ====================
+
+        # Temporarily reshape batch to decode-only
+        batch.reqs = list(decode_reqs)
+        batch.req_pool_indices = saved_req_pool_indices[num_extend:]
+        batch.seq_lens = saved_seq_lens[num_extend:].clone()
+        batch.seq_lens_cpu = saved_seq_lens_cpu[num_extend:].clone()
+        if saved_orig_seq_lens is not None:
+            batch.orig_seq_lens = saved_orig_seq_lens[num_extend:].clone()
+        batch.forward_mode = ForwardMode.DECODE
+        batch.spec_info = decode_spec_info
+        batch.seq_lens_sum = batch.seq_lens.sum().item()
+        batch.return_logprob = False
+        batch.is_extend_in_batch = False
+        batch.all_extend_in_batch = False
+        batch.has_grammar = any(r.grammar for r in decode_reqs)
+        batch.has_stream = any(r.stream for r in decode_reqs)
+
+        # If penalizer is active, need matching sampling_info for draft
+        if saved_sampling_info.penalizer_orchestrator.is_required:
+            decode_sampling = copy.deepcopy(saved_sampling_info)
+            d_idx = list(range(num_extend, num_extend + num_decode))
+            d_idx_t = torch.tensor(d_idx, dtype=torch.int64, device=batch.device)
+            decode_sampling.filter_batch(d_idx, d_idx_t)
+            batch.sampling_info = decode_sampling
+
+        # --- Draft ---
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            spec_info = self.draft(batch)
+
+        # --- Verify (target model forward + accept/reject) ---
+        verify_logits_output, verify_output, _, _ = self.verify(batch, spec_info)
+
+        # --- Draft extend after decode ---
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            if (
+                self.server_args.enable_dp_attention
+                or batch.spec_info.verified_id.shape[0] > 0
+            ):
+                self.forward_draft_extend_after_decode(batch)
+
+        # Save decode phase results (batch state has been updated by verify)
+        decode_spec_info_after = batch.spec_info
+        decode_seq_lens_after = batch.seq_lens.clone()
+        decode_seq_lens_cpu_after = batch.seq_lens_cpu.clone()
+        decode_req_pool_indices_after = batch.req_pool_indices.clone()
+        decode_orig_seq_lens_after = (
+            batch.orig_seq_lens.clone()
+            if batch.orig_seq_lens is not None
+            else None
+        )
+
+        # ==================== Phase 2: Extend (target_extend → draft_extend) ====================
+
+        batch.reqs = list(extend_reqs)
+        batch.req_pool_indices = saved_req_pool_indices[:num_extend]
+        batch.seq_lens = saved_seq_lens[:num_extend].clone()
+        batch.seq_lens_cpu = saved_seq_lens_cpu[:num_extend].clone()
+        if saved_orig_seq_lens is not None:
+            batch.orig_seq_lens = saved_orig_seq_lens[:num_extend].clone()
+        batch.input_ids = saved_input_ids[:num_extend_tokens]
+        batch.out_cache_loc = saved_out_cache_loc[:num_extend_tokens]
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.spec_info = None
+        batch.extend_lens = saved_extend_lens[:num_extend]
+        batch.prefix_lens = saved_prefix_lens[:num_extend]
+        batch.extend_num_tokens = num_extend_tokens
+        batch.seq_lens_sum = batch.seq_lens.sum().item()
+        batch.return_hidden_states = True
+        batch.return_logprob = saved_return_logprob
+        batch.is_extend_in_batch = True
+        batch.all_extend_in_batch = True
+        batch.has_grammar = any(r.grammar for r in extend_reqs)
+        batch.has_stream = any(r.stream for r in extend_reqs)
+
+        if saved_extend_logprob_start_lens is not None:
+            batch.extend_logprob_start_lens = saved_extend_logprob_start_lens[
+                :num_extend
+            ]
+        if batch.return_logprob:
+            if saved_top_logprobs_nums is not None:
+                batch.top_logprobs_nums = saved_top_logprobs_nums[:num_extend]
+            if saved_token_ids_logprobs is not None:
+                batch.token_ids_logprobs = saved_token_ids_logprobs[:num_extend]
+
+        # Filter sampling_info for extend reqs
+        extend_sampling = copy.deepcopy(saved_sampling_info)
+        e_idx = list(range(num_extend))
+        e_idx_t = torch.tensor(e_idx, dtype=torch.int64, device=batch.device)
+        extend_sampling.filter_batch(e_idx, e_idx_t)
+        batch.sampling_info = extend_sampling
+
+        # --- Target extend ---
+        (
+            extend_logits_output,
+            extend_next_token_ids,
+            extend_seq_lens_cpu,
+            extend_can_run_cuda_graph,
+        ) = self.forward_target_extend(batch)
+
+        # --- Draft extend ---
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.forward_draft_extend(
+                batch,
+                extend_logits_output.hidden_states,
+                extend_next_token_ids,
+                extend_seq_lens_cpu,
+                extend_logits_output.mm_input_embeds,
+            )
+
+        extend_spec_info_after = batch.spec_info
+
+        # ==================== Phase 3: Merge results ====================
+
+        # Restore batch with both sets of reqs: [extend, decode] (original order)
+        batch.reqs = list(extend_reqs) + list(decode_reqs)
+        batch.req_pool_indices = torch.cat(
+            [batch.req_pool_indices, decode_req_pool_indices_after]
+        )
+        batch.seq_lens = torch.cat([batch.seq_lens, decode_seq_lens_after])
+        batch.seq_lens_cpu = torch.cat(
+            [batch.seq_lens_cpu, decode_seq_lens_cpu_after]
+        )
+        if decode_orig_seq_lens_after is not None and batch.orig_seq_lens is not None:
+            batch.orig_seq_lens = torch.cat(
+                [batch.orig_seq_lens, decode_orig_seq_lens_after]
+            )
+        batch.seq_lens_sum = batch.seq_lens.sum().item()
+        batch.forward_mode = ForwardMode.MIXED
+        batch.sampling_info = saved_sampling_info
+        batch.return_logprob = saved_return_logprob
+        batch.decoding_reqs = decode_reqs
+        batch.is_extend_in_batch = saved_is_extend_in_batch
+        batch.has_grammar = saved_has_grammar
+        batch.has_stream = saved_has_stream
+
+        # Merge spec_info: extend first, decode last (matching reqs order)
+        if extend_spec_info_after is not None and decode_spec_info_after is not None:
+            extend_spec_info_after.merge_batch(decode_spec_info_after)
+            batch.spec_info = extend_spec_info_after
+        elif decode_spec_info_after is not None:
+            batch.spec_info = decode_spec_info_after
+        else:
+            batch.spec_info = extend_spec_info_after
+
+        # Build merged next_token_ids: extend reqs get sampled tokens,
+        # decode reqs get placeholders (skipped by output processor).
+        placeholder_decode = torch.zeros(
+            num_decode,
+            dtype=extend_next_token_ids.dtype,
+            device=extend_next_token_ids.device,
+        )
+        merged_next_token_ids = torch.cat(
+            [extend_next_token_ids, placeholder_decode]
+        )
+
+        # Build merged logits_output
+        vocab_size = extend_logits_output.next_token_logits.shape[-1]
+        decode_logits_placeholder = torch.zeros(
+            num_decode,
+            vocab_size,
+            dtype=extend_logits_output.next_token_logits.dtype,
+            device=extend_logits_output.next_token_logits.device,
+        )
+        merged_logits = LogitsProcessorOutput(
+            next_token_logits=torch.cat(
+                [extend_logits_output.next_token_logits, decode_logits_placeholder]
+            ),
+            next_token_logprobs=(
+                extend_logits_output.next_token_logprobs
+                if hasattr(extend_logits_output, "next_token_logprobs")
+                else None
+            ),
+            input_token_logprobs=(
+                extend_logits_output.input_token_logprobs
+                if hasattr(extend_logits_output, "input_token_logprobs")
+                else None
+            ),
+            input_top_logprobs_val=(
+                extend_logits_output.input_top_logprobs_val
+                if hasattr(extend_logits_output, "input_top_logprobs_val")
+                else None
+            ),
+            input_top_logprobs_idx=(
+                extend_logits_output.input_top_logprobs_idx
+                if hasattr(extend_logits_output, "input_top_logprobs_idx")
+                else None
+            ),
+            next_token_top_logprobs_val=(
+                extend_logits_output.next_token_top_logprobs_val
+                if hasattr(extend_logits_output, "next_token_top_logprobs_val")
+                else None
+            ),
+            next_token_top_logprobs_idx=(
+                extend_logits_output.next_token_top_logprobs_idx
+                if hasattr(extend_logits_output, "next_token_top_logprobs_idx")
+                else None
+            ),
+            hidden_states=None,
+        )
+
+        return GenerationBatchResult(
+            logits_output=merged_logits,
+            next_token_ids=merged_next_token_ids,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=False,
+        )
+
+    def _forward_extend_path(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """Fallback: run the existing extend/workaround path for mixed batches."""
+        (
+            logits_output,
+            next_token_ids,
+            seq_lens_cpu,
+            can_run_cuda_graph,
+        ) = self.forward_target_extend(batch)
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.forward_draft_extend(
+                batch,
+                logits_output.hidden_states,
+                next_token_ids,
+                seq_lens_cpu,
+                logits_output.mm_input_embeds,
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = batch.spec_info.verified_id.shape[0] > 0

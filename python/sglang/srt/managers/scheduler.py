@@ -2658,6 +2658,7 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+            new_batch.decode_spec_info = None
 
         return new_batch
 

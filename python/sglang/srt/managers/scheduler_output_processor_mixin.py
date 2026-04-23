@@ -175,21 +175,26 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.finished() or req.is_retracted:
-                    # decode req in mixed batch or retracted req
-                    continue
-
-                # For spec decode v1, decode reqs in a MIXED batch have their
-                # output_ids and finish-state managed by verify() inside the
-                # spec decode cycle. Appending a token here would insert a
-                # spurious token that de-syncs output_ids from seq_lens and
-                # the KV cache, corrupting the next spec decode cycle.
-                if (
+                # Decode reqs in a MIXED batch with spec decode v1:
+                # Their output_ids are managed by verify() or skipped (old workaround).
+                is_spec_v1_decode = (
                     not batch.spec_algorithm.is_none()
                     and not batch.is_spec_v2
                     and batch.decoding_reqs is not None
                     and req in batch.decoding_reqs
-                ):
+                )
+                if is_spec_v1_decode:
+                    if result.accept_length_per_req_cpu is not None:
+                        # Mixed verify+extend was done. verify() already handled
+                        # output_ids, check_finished, grammar, reasoning tokens.
+                        # Do post-processing: KV release, time stats, grammar flag.
+                        req.time_stats.set_last_decode_finish_time()
+                        self._handle_finished_req(req, i, logits_output)
+                        if req.grammar is not None:
+                            req.grammar.finished = req.finished()
+                    continue
+
+                if req.finished() or req.is_retracted:
                     continue
 
                 if req.is_chunked <= 0:
@@ -345,6 +350,18 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+        # Track spec metrics for decode reqs that went through mixed verify+extend
+        if (
+            self.is_generation
+            and result.accept_length_per_req_cpu is not None
+            and batch.decoding_reqs is not None
+            and not batch.spec_algorithm.is_none()
+        ):
+            self.num_generated_tokens += len(batch.decoding_reqs)
+            self.update_spec_metrics(
+                len(batch.decoding_reqs), result.num_accepted_tokens
+            )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
