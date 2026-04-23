@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    compute_position_torch,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -357,11 +358,13 @@ class EAGLEWorker(TpModelWorker):
     def forward_mixed_verify_extend(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        """Mixed batch: decode reqs do full spec decode, extend reqs do normal prefill.
+        """Mixed batch: ONE merged target forward with flashinfer two-pass attention.
 
-        Currently uses two separate target model forwards (one for verify, one for
-        extend). A future optimisation will merge them into a single forward with
-        split attention (see design doc Phase 2).
+        Decode reqs do full spec decode (draft → verify → draft_extend_after_decode).
+        Extend reqs do normal prefill (target extend → draft extend).
+        Both share a single merged target model forward using flashinfer's
+        two-pass attention: verify tokens via tree attention, extend tokens via
+        causal attention.
         """
 
         decode_reqs = batch.decoding_reqs
@@ -375,8 +378,6 @@ class EAGLEWorker(TpModelWorker):
         #   input_ids = [extend_tokens ..., 1-token-per-decode-req ...]
         num_extend_tokens = sum(batch.extend_lens[:num_extend])
 
-        # decode_spec_info is saved by mix_with_running from running_batch.spec_info,
-        # already aligned with decoding_reqs after filter_batch.
         decode_spec_info = batch.decode_spec_info
 
         # ===================== Save original batch state =====================
@@ -416,9 +417,8 @@ class EAGLEWorker(TpModelWorker):
         saved_has_grammar = batch.has_grammar
         saved_has_stream = batch.has_stream
 
-        # ==================== Phase 1: Decode (draft → verify → draft_extend) ====================
+        # ==================== Phase 1: Draft (decode subset only) ====================
 
-        # Temporarily reshape batch to decode-only
         batch.reqs = list(decode_reqs)
         batch.req_pool_indices = saved_req_pool_indices[num_extend:]
         batch.seq_lens = saved_seq_lens[num_extend:].clone()
@@ -434,7 +434,6 @@ class EAGLEWorker(TpModelWorker):
         batch.has_grammar = any(r.grammar for r in decode_reqs)
         batch.has_stream = any(r.stream for r in decode_reqs)
 
-        # If penalizer is active, need matching sampling_info for draft
         if saved_sampling_info.penalizer_orchestrator.is_required:
             decode_sampling = copy.deepcopy(saved_sampling_info)
             d_idx = list(range(num_extend, num_extend + num_decode))
@@ -442,7 +441,6 @@ class EAGLEWorker(TpModelWorker):
             decode_sampling.filter_batch(d_idx, d_idx_t)
             batch.sampling_info = decode_sampling
 
-        # --- Draft ---
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
@@ -450,10 +448,204 @@ class EAGLEWorker(TpModelWorker):
         ):
             spec_info = self.draft(batch)
 
-        # --- Verify (target model forward + accept/reject) ---
-        verify_logits_output, verify_output, _, _ = self.verify(batch, spec_info)
+        # ==================== Phase 1.5: Prepare for verify ====================
 
-        # --- Draft extend after decode ---
+        seq_lens_pre_verify = batch.seq_lens.clone()
+        spec_info.prepare_for_verify(batch, self.page_size)
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+
+        verify_input_ids = batch.input_ids
+        verify_out_cache_loc = batch.out_cache_loc
+        verify_req_pool_indices = batch.req_pool_indices
+        verify_seq_lens = batch.seq_lens.clone()
+        verify_seq_lens_cpu = spec_info.seq_lens_cpu
+        verify_positions = spec_info.positions
+        num_verify_tokens = spec_info.draft_token_num
+
+        vocab_mask = None
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrive_next_token.shape
+            ).cpu()
+
+        # ==================== Phase 2: ONE merged target forward ====================
+        # Batch ordering: verify reqs FIRST, extend reqs SECOND
+        # (flashinfer two-pass expects verify tokens before extend tokens)
+
+        extend_input_ids = saved_input_ids[:num_extend_tokens]
+        extend_out_cache_loc = saved_out_cache_loc[:num_extend_tokens]
+        extend_req_pool_indices = saved_req_pool_indices[:num_extend]
+        extend_seq_lens = saved_seq_lens[:num_extend]
+        extend_seq_lens_cpu = saved_seq_lens_cpu[:num_extend]
+        extend_prefix_lens_list = saved_prefix_lens[:num_extend]
+        extend_extend_lens_list = saved_extend_lens[:num_extend]
+
+        extend_prefix_lens_t = torch.tensor(
+            extend_prefix_lens_list, dtype=torch.int32, device=batch.device
+        )
+        extend_extend_lens_t = torch.tensor(
+            extend_extend_lens_list, dtype=torch.int32, device=batch.device
+        )
+        extend_positions, _ = compute_position_torch(
+            extend_prefix_lens_t, extend_extend_lens_t
+        )
+
+        merged_input_ids = torch.cat([verify_input_ids, extend_input_ids])
+        merged_out_cache_loc = torch.cat([verify_out_cache_loc, extend_out_cache_loc])
+        merged_req_pool_indices = torch.cat(
+            [verify_req_pool_indices, extend_req_pool_indices]
+        )
+        merged_seq_lens = torch.cat([verify_seq_lens, extend_seq_lens])
+        merged_seq_lens_cpu = torch.cat([verify_seq_lens_cpu, extend_seq_lens_cpu])
+        merged_positions = torch.cat(
+            [verify_positions.to(torch.int64), extend_positions.to(torch.int64)]
+        )
+
+        batch.reqs = list(decode_reqs) + list(extend_reqs)
+        batch.req_pool_indices = merged_req_pool_indices
+        batch.seq_lens = merged_seq_lens
+        batch.seq_lens_cpu = merged_seq_lens_cpu
+        if saved_orig_seq_lens is not None:
+            batch.orig_seq_lens = torch.cat([
+                saved_orig_seq_lens[num_extend:],
+                saved_orig_seq_lens[:num_extend],
+            ])
+        batch.input_ids = merged_input_ids
+        batch.out_cache_loc = merged_out_cache_loc
+        batch.forward_mode = ForwardMode.MIXED
+        batch.seq_lens_sum = merged_seq_lens.sum().item()
+        batch.return_logprob = False
+        batch.return_hidden_states = True
+        batch.is_extend_in_batch = True
+        batch.all_extend_in_batch = False
+        batch.has_grammar = saved_has_grammar
+        batch.has_stream = saved_has_stream
+
+        # extend_* fields: only for extend reqs (used by flashinfer extend part)
+        batch.prefix_lens = extend_prefix_lens_list
+        batch.extend_lens = extend_extend_lens_list
+        batch.extend_num_tokens = num_extend_tokens
+        batch.extend_logprob_start_lens = [0] * num_extend
+        batch.top_logprobs_nums = None
+        batch.token_ids_logprobs = None
+
+        # Fields for flashinfer two-pass attention
+        batch.num_verify_reqs = num_decode
+        batch.num_verify_tokens = num_verify_tokens
+        batch.verify_spec_info = spec_info
+
+        # Set merged positions via spec_info so ForwardBatch.init_new picks them up
+        spec_info.positions = merged_positions
+        batch.spec_info = spec_info
+
+        # Reorder sampling_info: [decode, extend] to match merged batch order
+        merged_sampling = copy.deepcopy(saved_sampling_info)
+        reorder_idx = (
+            list(range(num_extend, num_extend + num_decode))
+            + list(range(num_extend))
+        )
+        reorder_idx_t = torch.tensor(
+            reorder_idx, dtype=torch.int64, device=batch.device
+        )
+        merged_sampling.filter_batch(reorder_idx, reorder_idx_t)
+        batch.sampling_info = merged_sampling
+
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output = batch_result.logits_output
+        can_run_cuda_graph = batch_result.can_run_cuda_graph
+
+        maybe_detect_nan(
+            logits_output.next_token_logits, "merged_verify_extend: target model logits"
+        )
+
+        # ==================== Phase 3: Split output + verify + sample ====================
+
+        # 3a: Verify — accept/reject on decode reqs
+        verify_logits_output = LogitsProcessorOutput(
+            next_token_logits=logits_output.next_token_logits[:num_verify_tokens],
+            hidden_states=logits_output.hidden_states[:num_verify_tokens],
+            next_token_logprobs=None,
+            input_token_logprobs=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_idx=None,
+            next_token_top_logprobs_val=None,
+            next_token_top_logprobs_idx=None,
+        )
+
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                decode_reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                batch.sampling_info.vocab_mask = None
+
+        # Reshape batch to decode-only for verify
+        batch.reqs = list(decode_reqs)
+        batch.req_pool_indices = verify_req_pool_indices
+        batch.seq_lens = verify_seq_lens
+        batch.seq_lens_cpu = verify_seq_lens_cpu
+        batch.spec_info = spec_info
+        batch.return_hidden_states = False
+
+        spec_info.hidden_states = verify_logits_output.hidden_states
+        res = spec_info.verify(
+            batch,
+            verify_logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            vocab_mask,
+        )
+
+        verify_logits_output.next_token_logits = (
+            verify_logits_output.next_token_logits[res.accepted_indices]
+        )
+        verify_logits_output.hidden_states = (
+            verify_logits_output.hidden_states[res.accepted_indices]
+        )
+
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
+        ):
+            self._mamba_verify_update(
+                batch, res, verify_logits_output, spec_info, seq_lens_pre_verify
+            )
+
+        if batch.return_logprob:
+            add_output_logprobs_for_spec_v1(batch, res, verify_logits_output)
+
+        batch.forward_mode = (
+            ForwardMode.DECODE
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        batch.spec_info = res.draft_input
+
+        # Save decode results (batch state updated by verify)
+        decode_spec_info_after = batch.spec_info
+        decode_seq_lens_after = batch.seq_lens.clone()
+        decode_seq_lens_cpu_after = batch.seq_lens_cpu.clone()
+        decode_req_pool_indices_after = batch.req_pool_indices.clone()
+        decode_orig_seq_lens_after = (
+            batch.orig_seq_lens.clone()
+            if batch.orig_seq_lens is not None
+            else None
+        )
+
+        # 3b: Draft extend after decode
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
@@ -465,31 +657,55 @@ class EAGLEWorker(TpModelWorker):
             ):
                 self.forward_draft_extend_after_decode(batch)
 
-        # Save decode phase results (batch state has been updated by verify)
-        decode_spec_info_after = batch.spec_info
-        decode_seq_lens_after = batch.seq_lens.clone()
-        decode_seq_lens_cpu_after = batch.seq_lens_cpu.clone()
-        decode_req_pool_indices_after = batch.req_pool_indices.clone()
-        decode_orig_seq_lens_after = (
-            batch.orig_seq_lens.clone()
-            if batch.orig_seq_lens is not None
-            else None
+        # 3c: Sample extend tokens from merged output
+        extend_all_logits = logits_output.next_token_logits[num_verify_tokens:]
+        extend_all_hidden = logits_output.hidden_states[num_verify_tokens:]
+
+        extend_cumsum = torch.cumsum(extend_extend_lens_t.to(batch.device), dim=0)
+        extend_last_indices = (extend_cumsum - 1).long()
+        extend_last_logits = extend_all_logits[extend_last_indices]
+
+        extend_logits_output = LogitsProcessorOutput(
+            next_token_logits=extend_last_logits,
+            hidden_states=extend_all_hidden,
+            next_token_logprobs=None,
+            input_token_logprobs=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_idx=None,
+            next_token_top_logprobs_val=None,
+            next_token_top_logprobs_idx=None,
+            mm_input_embeds=logits_output.mm_input_embeds,
         )
 
-        # ==================== Phase 2: Extend (target_extend → draft_extend) ====================
+        extend_sampling = copy.deepcopy(saved_sampling_info)
+        e_idx = list(range(num_extend))
+        e_idx_t = torch.tensor(e_idx, dtype=torch.int64, device=batch.device)
+        extend_sampling.filter_batch(e_idx, e_idx_t)
 
+        model_runner = self.target_worker.model_runner
+        model_runner._preprocess_logits(extend_logits_output, extend_sampling)
+        extend_next_token_ids = model_runner.sampler(
+            extend_logits_output,
+            extend_sampling,
+            False,
+            saved_top_logprobs_nums[:num_extend] if saved_top_logprobs_nums else None,
+            saved_token_ids_logprobs[:num_extend] if saved_token_ids_logprobs else None,
+            extend_seq_lens - 1,
+        )
+
+        # 3d: Draft extend for extend reqs
         batch.reqs = list(extend_reqs)
-        batch.req_pool_indices = saved_req_pool_indices[:num_extend]
-        batch.seq_lens = saved_seq_lens[:num_extend].clone()
-        batch.seq_lens_cpu = saved_seq_lens_cpu[:num_extend].clone()
+        batch.req_pool_indices = extend_req_pool_indices
+        batch.seq_lens = extend_seq_lens.clone()
+        batch.seq_lens_cpu = extend_seq_lens_cpu.clone()
         if saved_orig_seq_lens is not None:
             batch.orig_seq_lens = saved_orig_seq_lens[:num_extend].clone()
-        batch.input_ids = saved_input_ids[:num_extend_tokens]
-        batch.out_cache_loc = saved_out_cache_loc[:num_extend_tokens]
+        batch.input_ids = extend_input_ids
+        batch.out_cache_loc = extend_out_cache_loc
         batch.forward_mode = ForwardMode.EXTEND
         batch.spec_info = None
-        batch.extend_lens = saved_extend_lens[:num_extend]
-        batch.prefix_lens = saved_prefix_lens[:num_extend]
+        batch.extend_lens = extend_extend_lens_list
+        batch.prefix_lens = extend_prefix_lens_list
         batch.extend_num_tokens = num_extend_tokens
         batch.seq_lens_sum = batch.seq_lens.sum().item()
         batch.return_hidden_states = True
@@ -498,6 +714,12 @@ class EAGLEWorker(TpModelWorker):
         batch.all_extend_in_batch = True
         batch.has_grammar = any(r.grammar for r in extend_reqs)
         batch.has_stream = any(r.stream for r in extend_reqs)
+        batch.sampling_info = extend_sampling
+
+        # Clear merged-forward-only fields
+        batch.num_verify_reqs = 0
+        batch.num_verify_tokens = 0
+        batch.verify_spec_info = None
 
         if saved_extend_logprob_start_lens is not None:
             batch.extend_logprob_start_lens = saved_extend_logprob_start_lens[
@@ -509,22 +731,6 @@ class EAGLEWorker(TpModelWorker):
             if saved_token_ids_logprobs is not None:
                 batch.token_ids_logprobs = saved_token_ids_logprobs[:num_extend]
 
-        # Filter sampling_info for extend reqs
-        extend_sampling = copy.deepcopy(saved_sampling_info)
-        e_idx = list(range(num_extend))
-        e_idx_t = torch.tensor(e_idx, dtype=torch.int64, device=batch.device)
-        extend_sampling.filter_batch(e_idx, e_idx_t)
-        batch.sampling_info = extend_sampling
-
-        # --- Target extend ---
-        (
-            extend_logits_output,
-            extend_next_token_ids,
-            extend_seq_lens_cpu,
-            extend_can_run_cuda_graph,
-        ) = self.forward_target_extend(batch)
-
-        # --- Draft extend ---
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
@@ -532,7 +738,7 @@ class EAGLEWorker(TpModelWorker):
         ):
             self.forward_draft_extend(
                 batch,
-                extend_logits_output.hidden_states,
+                extend_all_hidden,
                 extend_next_token_ids,
                 extend_seq_lens_cpu,
                 extend_logits_output.mm_input_embeds,
@@ -540,9 +746,8 @@ class EAGLEWorker(TpModelWorker):
 
         extend_spec_info_after = batch.spec_info
 
-        # ==================== Phase 3: Merge results ====================
+        # ==================== Phase 4: Merge results ====================
 
-        # Restore batch with both sets of reqs: [extend, decode] (original order)
         batch.reqs = list(extend_reqs) + list(decode_reqs)
         batch.req_pool_indices = torch.cat(
             [batch.req_pool_indices, decode_req_pool_indices_after]
@@ -564,7 +769,6 @@ class EAGLEWorker(TpModelWorker):
         batch.has_grammar = saved_has_grammar
         batch.has_stream = saved_has_stream
 
-        # Merge spec_info: extend first, decode last (matching reqs order)
         if extend_spec_info_after is not None and decode_spec_info_after is not None:
             extend_spec_info_after.merge_batch(decode_spec_info_after)
             batch.spec_info = extend_spec_info_after
@@ -573,8 +777,6 @@ class EAGLEWorker(TpModelWorker):
         else:
             batch.spec_info = extend_spec_info_after
 
-        # Build merged next_token_ids: extend reqs get sampled tokens,
-        # decode reqs get placeholders (skipped by output processor).
         placeholder_decode = torch.zeros(
             num_decode,
             dtype=extend_next_token_ids.dtype,
@@ -584,7 +786,6 @@ class EAGLEWorker(TpModelWorker):
             [extend_next_token_ids, placeholder_decode]
         )
 
-        # Build merged logits_output
         vocab_size = extend_logits_output.next_token_logits.shape[-1]
         decode_logits_placeholder = torch.zeros(
             num_decode,
@@ -632,8 +833,8 @@ class EAGLEWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=merged_logits,
             next_token_ids=merged_next_token_ids,
-            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            num_accepted_tokens=sum(res.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=res.accept_length_per_req_cpu,
             can_run_cuda_graph=False,
         )
 

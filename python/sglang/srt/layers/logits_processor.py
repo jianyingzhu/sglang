@@ -148,6 +148,9 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Mixed verify+extend: number of verify tokens (triggers all-token logits)
+    num_verify_tokens: int = 0
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
@@ -201,6 +204,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            num_verify_tokens=getattr(forward_batch, 'num_verify_tokens', 0),
         )
 
     def compute_dp_attention_metadata(self):
@@ -411,6 +415,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or logits_metadata.num_verify_tokens > 0
         ):
             pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm

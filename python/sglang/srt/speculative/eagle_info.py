@@ -1,5 +1,5 @@
 import logging
-from copy import copy
+import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 

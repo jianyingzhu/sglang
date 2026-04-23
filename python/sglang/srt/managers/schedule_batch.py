@@ -2457,6 +2457,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            num_verify_reqs=getattr(self, 'num_verify_reqs', 0),
+            num_verify_tokens=getattr(self, 'num_verify_tokens', 0),
+            verify_spec_info=getattr(self, 'verify_spec_info', None),
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2658,6 +2661,11 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+
+    # Mixed verify+extend fields (set by eagle_worker before get_model_worker_batch)
+    num_verify_reqs: int = 0
+    num_verify_tokens: int = 0
+    verify_spec_info: Optional[SpecInput] = None
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
