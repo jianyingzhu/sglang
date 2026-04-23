@@ -101,6 +101,9 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
+    # Mixed verify+extend: separate wrappers for verify part (tree attention)
+    verify_wrappers: Optional[List[BatchPrefillWithPagedKVCacheWrapper]] = None
+    num_verify_tokens: int = 0
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -466,6 +469,75 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify, False, False
             )
+        elif (
+            forward_batch.forward_mode.is_mixed()
+            and forward_batch.num_verify_reqs > 0
+        ):
+            nv = forward_batch.num_verify_reqs
+
+            # Verify part: first nv requests, tree attention via spec_info
+            verify_seq_lens = forward_batch.seq_lens[:nv]
+            verify_seq_lens_cpu = (
+                forward_batch.seq_lens_cpu[:nv]
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            )
+            verify_seq_lens_sum = (
+                verify_seq_lens_cpu.sum().item()
+                if verify_seq_lens_cpu is not None
+                else verify_seq_lens.sum().item()
+            )
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices[:nv],
+                verify_seq_lens,
+                verify_seq_lens_cpu,
+                verify_seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_wrappers_verify,
+                use_ragged=False,
+                encoder_lens=(
+                    forward_batch.encoder_lens[:nv]
+                    if forward_batch.encoder_lens is not None
+                    else None
+                ),
+                spec_info=forward_batch.verify_spec_info,
+            )
+
+            # Extend part: remaining requests, causal attention
+            extend_seq_lens = forward_batch.seq_lens[nv:]
+            extend_seq_lens_cpu = (
+                forward_batch.seq_lens_cpu[nv:]
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            )
+            extend_seq_lens_sum = (
+                extend_seq_lens_cpu.sum().item()
+                if extend_seq_lens_cpu is not None
+                else extend_seq_lens.sum().item()
+            )
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices[nv:],
+                extend_seq_lens,
+                extend_seq_lens_cpu,
+                extend_seq_lens_sum,
+                forward_batch.extend_prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=(
+                    forward_batch.encoder_lens[nv:]
+                    if forward_batch.encoder_lens is not None
+                    else None
+                ),
+                spec_info=None,
+            )
+
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                verify_wrappers=self.prefill_wrappers_verify,
+                num_verify_tokens=forward_batch.num_verify_tokens,
+            )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -773,6 +845,15 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Mixed verify+extend: two-pass attention
+        if (
+            self.forward_metadata.verify_wrappers is not None
+            and self.forward_metadata.num_verify_tokens > 0
+        ):
+            return self._forward_mixed_verify_extend(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -875,6 +956,69 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_mixed_verify_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+    ):
+        """Two-pass attention for mixed verify+extend batch.
+
+        Verify tokens (first nv) use tree attention via prefill_wrappers_verify.
+        Extend tokens (rest) use causal attention via prefill_wrappers_paged.
+        """
+        nv = self.forward_metadata.num_verify_tokens
+        wrapper_idx = self._get_wrapper_idx(layer)
+        verify_wrapper = self.forward_metadata.verify_wrappers[wrapper_idx]
+        extend_wrapper = self.forward_metadata.prefill_wrappers[wrapper_idx]
+
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        # Write all k, v to KV cache (both verify and extend tokens)
+        q = q.contiguous()
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        # Pass 1: verify tokens — tree attention (custom_mask set during begin_forward)
+        o_verify = verify_wrapper.forward(
+            q[:nv].view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_buffer,
+            causal=True,
+            sm_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+
+        # Pass 2: extend tokens — causal attention
+        o_extend = extend_wrapper.forward(
+            q[nv:].view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_buffer,
+            causal=True,
+            sm_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+
+        o = torch.cat([o_verify, o_extend], dim=0)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     @debug_kernel_api

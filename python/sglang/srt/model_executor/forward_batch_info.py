@@ -403,6 +403,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mm_input_embeds: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # Mixed verify+extend: verify reqs first, extend reqs second in the batch
+    num_verify_reqs: int = 0
+    num_verify_tokens: int = 0
+    verify_spec_info: Optional[SpecInput] = None
+
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
