@@ -1966,16 +1966,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
-
-        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
-        )
+        # Each decode request extends by exactly 1 token, so prefix_lens must
+        # equal seq_lens - 1 to keep seq_lens[i] - prefix_lens[i] == 1.
+        # We derive prefix_lens from the authoritative seq_lens tensor rather
+        # than from len(output_ids).  This matters for spec-decode v1 where
+        # process_batch_result_prefill appends to output_ids but seq_lens is
+        # never incremented (prepare_for_decode returns early), making
+        # output_ids permanently 1 ahead of seq_lens.
+        seq_lens_cpu = running_batch.seq_lens_cpu.tolist()
+        self.prefix_lens.extend([int(sl) - 1 for sl in seq_lens_cpu])
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
