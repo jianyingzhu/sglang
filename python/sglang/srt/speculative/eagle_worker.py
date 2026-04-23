@@ -460,7 +460,7 @@ class EAGLEWorker(TpModelWorker):
         verify_seq_lens = batch.seq_lens.clone()
         verify_seq_lens_cpu = spec_info.seq_lens_cpu
         verify_positions = spec_info.positions
-        num_verify_tokens = spec_info.draft_token_num
+        num_verify_tokens = verify_input_ids.shape[0]
 
         vocab_mask = None
         if batch.has_grammar:
@@ -596,6 +596,7 @@ class EAGLEWorker(TpModelWorker):
         batch.req_pool_indices = verify_req_pool_indices
         batch.seq_lens = verify_seq_lens
         batch.seq_lens_cpu = verify_seq_lens_cpu
+        batch.out_cache_loc = verify_out_cache_loc
         batch.spec_info = spec_info
         batch.return_hidden_states = False
 

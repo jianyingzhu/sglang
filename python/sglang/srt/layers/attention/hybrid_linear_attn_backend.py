@@ -192,6 +192,28 @@ class MambaAttnBackendBase(AttentionBackend):
                     # retrieve_next_token is None during dummy run so skip tensor creation
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
+            elif (
+                forward_batch.forward_mode.is_mixed()
+                and getattr(forward_batch, "num_verify_reqs", 0) > 0
+            ):
+                nv_reqs = forward_batch.num_verify_reqs
+                nv_tokens = forward_batch.num_verify_tokens
+                draft_token_num = forward_batch.verify_spec_info.draft_token_num
+                verify_starts = torch.arange(
+                    0,
+                    nv_tokens,
+                    step=draft_token_num,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                extend_starts = forward_batch.extend_start_loc + nv_tokens
+                query_start_loc = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                )
+                query_start_loc[:nv_reqs] = verify_starts
+                query_start_loc[nv_reqs:bs] = extend_starts
+                total_tokens = nv_tokens + forward_batch.extend_num_tokens
+                query_start_loc[bs] = total_tokens
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
