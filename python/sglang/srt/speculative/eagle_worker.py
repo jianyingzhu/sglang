@@ -614,6 +614,7 @@ class EAGLEWorker(TpModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            keep_finished=True,
         )
 
         verify_logits_output.next_token_logits = (
@@ -753,20 +754,6 @@ class EAGLEWorker(TpModelWorker):
             )
 
         extend_spec_info_after = batch.spec_info
-
-        # Expand decode spec_info to full num_decode entries if verify filtered
-        # out finished decode reqs. Without this, spec_info has fewer entries
-        # than batch.reqs, causing OOB in filter_batch's fancy indexing.
-        if (
-            decode_spec_info_after is not None
-            and decode_spec_info_after.verified_id is not None
-            and decode_spec_info_after.verified_id.shape[0] < num_decode
-        ):
-            self._expand_spec_info_to_full_size(
-                decode_spec_info_after,
-                num_decode,
-                verify_req_pool_indices,
-            )
 
         # ==================== Phase 4: Merge results ====================
 
@@ -1562,57 +1549,6 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
-
-    @staticmethod
-    def _expand_spec_info_to_full_size(
-        spec_info: EagleDraftInput,
-        num_full: int,
-        all_req_pool_indices: torch.Tensor,
-    ):
-        """Expand verify-filtered spec_info in-place to full batch size.
-
-        When verify() filters out finished reqs, spec_info only has entries for
-        unfinished reqs. This scatters those entries into full-size tensors
-        (zero-padded for finished reqs) so that filter_batch indexing works.
-        """
-        device = all_req_pool_indices.device
-        num_cur = spec_info.verified_id.shape[0]
-
-        if num_cur > 0 and spec_info.req_pool_indices_for_draft_extend is not None:
-            unfinished_pool = spec_info.req_pool_indices_for_draft_extend
-            pool_to_pos = {}
-            for i in range(all_req_pool_indices.shape[0]):
-                pool_to_pos[all_req_pool_indices[i].item()] = i
-            positions = torch.tensor(
-                [pool_to_pos[p.item()] for p in unfinished_pool],
-                dtype=torch.long,
-                device=device,
-            )
-        else:
-            positions = None
-
-        def scatter_2d(src):
-            if src is None or src.ndim < 2:
-                return src
-            full = torch.zeros(
-                num_full, src.shape[1], dtype=src.dtype, device=device
-            )
-            if positions is not None and src.shape[0] > 0:
-                full[positions] = src
-            return full
-
-        def scatter_1d(src):
-            if src is None or src.ndim < 1:
-                return src
-            full = torch.zeros(num_full, dtype=src.dtype, device=device)
-            if positions is not None and src.shape[0] > 0:
-                full[positions] = src
-            return full
-
-        spec_info.topk_p = scatter_2d(spec_info.topk_p)
-        spec_info.topk_index = scatter_2d(spec_info.topk_index)
-        spec_info.hidden_states = scatter_2d(spec_info.hidden_states)
-        spec_info.verified_id = scatter_1d(spec_info.verified_id)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

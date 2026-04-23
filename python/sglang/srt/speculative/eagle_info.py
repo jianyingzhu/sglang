@@ -227,6 +227,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        keep_finished: bool = False,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -528,7 +529,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
         # Construct EagleVerifyOutput
-        if not has_finished:
+        if not has_finished or keep_finished:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
                 assign_req_to_token_pool_func(
