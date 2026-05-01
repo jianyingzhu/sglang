@@ -290,6 +290,50 @@ class SamplingBatchInfo:
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
+    def create_filtered_copy(
+        self, keep_indices: List[int], keep_indices_device: torch.Tensor
+    ) -> "SamplingBatchInfo":
+        """Create a filtered copy without deepcopy when possible.
+
+        Falls back to deepcopy + filter_batch when penalizer or custom logit
+        processor state requires destructive in-place filtering.
+        """
+        import copy
+
+        if self.penalizer_orchestrator.is_required or self.has_custom_logit_processor:
+            result = copy.deepcopy(self)
+            result.filter_batch(keep_indices, keep_indices_device)
+            return result
+
+        return SamplingBatchInfo(
+            temperatures=self.temperatures[keep_indices_device],
+            top_ps=self.top_ps[keep_indices_device],
+            top_ks=self.top_ks[keep_indices_device],
+            min_ps=self.min_ps[keep_indices_device],
+            is_all_greedy=self.is_all_greedy,
+            need_top_p_sampling=self.need_top_p_sampling,
+            need_top_k_sampling=self.need_top_k_sampling,
+            need_min_p_sampling=self.need_min_p_sampling,
+            vocab_size=self.vocab_size,
+            grammars=(
+                [self.grammars[i] for i in keep_indices]
+                if self.grammars
+                else None
+            ),
+            penalizer_orchestrator=self.penalizer_orchestrator,
+            sampling_seed=(
+                self.sampling_seed[keep_indices_device]
+                if self.sampling_seed is not None
+                else None
+            ),
+            device=self.device,
+            logit_bias=(
+                self.logit_bias[keep_indices_device]
+                if self.logit_bias is not None
+                else None
+            ),
+        )
+
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):

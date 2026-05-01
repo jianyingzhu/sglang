@@ -601,10 +601,9 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
 
         # Restore decode-only sampling_info (merged_sampling is [decode, extend] order)
-        decode_verify_sampling = copy.deepcopy(merged_sampling)
         dv_idx = list(range(num_decode))
         dv_idx_t = torch.tensor(dv_idx, dtype=torch.int64, device=batch.device)
-        decode_verify_sampling.filter_batch(dv_idx, dv_idx_t)
+        decode_verify_sampling = merged_sampling.create_filtered_copy(dv_idx, dv_idx_t)
         batch.sampling_info = decode_verify_sampling
 
         spec_info.hidden_states = verify_logits_output.hidden_states
@@ -686,10 +685,9 @@ class EAGLEWorker(TpModelWorker):
             mm_input_embeds=logits_output.mm_input_embeds,
         )
 
-        extend_sampling = copy.deepcopy(saved_sampling_info)
         e_idx = list(range(num_extend))
         e_idx_t = torch.tensor(e_idx, dtype=torch.int64, device=batch.device)
-        extend_sampling.filter_batch(e_idx, e_idx_t)
+        extend_sampling = saved_sampling_info.create_filtered_copy(e_idx, e_idx_t)
 
         model_runner = self.target_worker.model_runner
         model_runner._preprocess_logits(extend_logits_output, extend_sampling)
