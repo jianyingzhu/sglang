@@ -817,6 +817,8 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Tokens matched by KV connector (e.g., FlexKV) for this request.
+        self.cached_tokens_extended_device = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1087,6 +1089,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    update_connector_state=True,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
