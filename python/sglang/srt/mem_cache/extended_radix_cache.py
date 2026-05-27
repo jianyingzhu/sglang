@@ -23,14 +23,23 @@ logger = logging.getLogger(__name__)
 
 
 class ExtendedRadixCache(BasePrefixCache):
-    """RadixCache decorator with external KV storage connector."""
+    """RadixCache decorator with external KV storage connector.
+
+    Wraps any BasePrefixCache implementation (RadixCache, SWARadixCache, etc.)
+    and adds external KV storage capabilities via a BaseKVConnector.
+    """
 
     def __init__(
         self,
         params: CacheInitParams,
         connector: Optional[BaseKVConnector] = None,
+        inner_cache: Optional[BasePrefixCache] = None,
     ):
-        self._inner_radixtree = RadixCache(params)
+        # Use provided inner cache, or create a default RadixCache
+        if inner_cache is not None:
+            self._inner_radixtree = inner_cache
+        else:
+            self._inner_radixtree = RadixCache(params)
         self._connector = connector
 
         self._load_task_id_counter = 0
@@ -280,6 +289,10 @@ class ExtendedRadixCache(BasePrefixCache):
             return
         self._check_store_completion()
         self._check_load_completion()
+
+    # Alias for compatibility with scheduler (which calls check_hicache_events)
+    def check_hicache_events(self):
+        self.check_kv_events()
 
     def prefetch(self, req: Req) -> None:
         if self._connector is None:

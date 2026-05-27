@@ -3960,11 +3960,9 @@ class ServerArgs:
                     "The arguments kv-connector-cls and disable-radix-cache are mutually exclusive "
                     "because ExtendedRadixCache requires radix cache enabled."
                 )
-            if self.enable_hierarchical_cache:
-                raise ValueError(
-                    "The arguments kv-connector-cls and enable-hierarchical-cache are mutually exclusive. "
-                    "Please use only one of them."
-                )
+            # Note: kv_connector_cls and enable_hierarchical_cache CAN coexist now.
+            # ExtendedRadixCache wraps any inner cache and provides its own
+            # event polling / load-back paths compatible with hierarchical scheduling.
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":

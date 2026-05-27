@@ -171,6 +171,27 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = default_radix_cache_factory(ctx)
         source = "default"
 
+    # -- KV Connector wrapping --
+    # If --kv-connector-cls is set, wrap the cache with ExtendedRadixCache
+    # which adds external KV storage capabilities (e.g., FlexKV).
+    # This works with ANY inner cache (RadixCache, SWARadixCache, etc.)
+    kv_connector_cls_name = ctx.server_args.kv_connector_cls
+    if kv_connector_cls_name is not None:
+        connector = _load_and_create_connector(kv_connector_cls_name, ctx)
+        if connector is not None:
+            from sglang.srt.mem_cache.extended_radix_cache import ExtendedRadixCache
+
+            cache = ExtendedRadixCache(
+                params=ctx.params,
+                connector=connector,
+                inner_cache=cache,
+            )
+            source = f"{source}+ExtendedRadixCache({kv_connector_cls_name})"
+            logger.info(
+                "KV connector enabled: cls=%s, wrapping cache with ExtendedRadixCache",
+                kv_connector_cls_name,
+            )
+
     streaming_wrapped = False
     if (
         ctx.server_args.enable_streaming_session
@@ -192,3 +213,59 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         streaming_wrapped,
     )
     return cache
+
+
+def _load_and_create_connector(
+    cls_name: str, ctx: TreeCacheBuildContext
+) -> Optional["BaseKVConnector"]:
+    """Dynamically load and instantiate the KV connector class.
+
+    Args:
+        cls_name: Fully qualified class name or a short alias.
+            Short aliases:
+              "flexkv" → sglang.srt.mem_cache.storage.flexkv.flexkv_connector.FlexKVConnector
+            Full paths: e.g. "my_module.MyConnector"
+        ctx: Build context with server_args, params, etc.
+
+    Returns:
+        Instantiated connector, or None if loading fails.
+    """
+    import importlib
+
+    # Short-name registry for convenience (--kv-connector-cls flexkv)
+    _CONNECTOR_ALIASES = {
+        "flexkv": "sglang.srt.mem_cache.storage.flexkv.flexkv_connector.FlexKVConnector",
+        "FlexKV": "sglang.srt.mem_cache.storage.flexkv.flexkv_connector.FlexKVConnector",
+        "lmcache": "sglang.srt.mem_cache.storage.lmcache.lmc_connector.LMCacheConnector",
+    }
+
+    # Resolve alias if applicable
+    resolved_name = _CONNECTOR_ALIASES.get(cls_name, cls_name)
+
+    try:
+        module_path, class_name = resolved_name.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        connector_cls = getattr(module, class_name)
+    except (ImportError, AttributeError, ValueError) as e:
+        logger.error(
+            "Failed to load kv_connector_cls=%r (resolved=%r): %s. "
+            "Falling back to no connector.",
+            cls_name, resolved_name, e,
+        )
+        return None
+
+    try:
+        connector = connector_cls(
+            params=ctx.params,
+            server_args=ctx.server_args,
+            tp_rank=ctx.tp_rank,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to instantiate kv_connector %s: %s. "
+            "Falling back to no connector.",
+            cls_name, e,
+        )
+        return None
+
+    return connector
