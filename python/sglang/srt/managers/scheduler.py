@@ -445,6 +445,9 @@ class Scheduler(
             ),
             ps=self.ps,
             tp_group=self.tp_group,
+            attn_tp_group=self.attn_tp_group,
+            attn_cp_group=self.attn_cp_group,
+            pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
         )
         self.is_hybrid_swa = result.is_hybrid_swa

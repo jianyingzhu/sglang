@@ -142,6 +142,9 @@ def build_kv_cache(
     enable_kv_cache_events: bool,
     ps: "ParallelState",
     tp_group: "GroupCoordinator",
+    attn_tp_group: "GroupCoordinator" = None,
+    attn_cp_group: "GroupCoordinator" = None,
+    pp_group: "GroupCoordinator" = None,
     enable_hierarchical_cache: bool,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
@@ -238,6 +241,11 @@ def build_kv_cache(
             tp_size=ps.tp_size,
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
+            attn_tp_group=attn_tp_group,
+            attn_cp_group=attn_cp_group,
+            pp_group=pp_group,
+            dp_rank=ps.dp_rank,
+            attn_cp_rank=ps.attn_cp_rank,
         )
     )
 

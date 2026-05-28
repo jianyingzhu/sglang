@@ -41,6 +41,11 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    attn_tp_group: Any = None
+    attn_cp_group: Any = None
+    pp_group: Any = None
+    dp_rank: Optional[int] = None
+    attn_cp_rank: int = 0
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -259,6 +264,11 @@ def _load_and_create_connector(
             params=ctx.params,
             server_args=ctx.server_args,
             tp_rank=ctx.tp_rank,
+            dp_rank=ctx.dp_rank,
+            attn_cp_rank=ctx.attn_cp_rank,
+            pp_group=ctx.pp_group,
+            attn_tp_group=ctx.attn_tp_group,
+            attn_cp_group=ctx.attn_cp_group,
         )
     except Exception as e:
         logger.error(
