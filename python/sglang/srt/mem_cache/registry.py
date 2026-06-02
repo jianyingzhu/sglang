@@ -260,15 +260,20 @@ def _load_and_create_connector(
         return None
 
     try:
+        # Connectors expect the same kwargs sglang internally hands to
+        # connector subclasses (see BaseKVConnector.__init__).  Source these
+        # from CacheInitParams (TP/CP groups, ranks) and TpWorker (DP rank,
+        # PP group).
+        tp_worker = ctx.tp_worker
         connector = connector_cls(
             params=ctx.params,
             server_args=ctx.server_args,
             tp_rank=ctx.tp_rank,
-            dp_rank=ctx.dp_rank,
-            attn_cp_rank=ctx.attn_cp_rank,
-            pp_group=ctx.pp_group,
-            attn_tp_group=ctx.attn_tp_group,
-            attn_cp_group=ctx.attn_cp_group,
+            dp_rank=getattr(tp_worker, "dp_rank", 0),
+            attn_cp_rank=getattr(ctx.params, "attn_cp_rank", 0),
+            pp_group=getattr(tp_worker, "pp_group", None),
+            attn_tp_group=ctx.params.attn_tp_cache_group,
+            attn_cp_group=ctx.params.attn_cp_cache_group,
         )
     except Exception as e:
         logger.error(

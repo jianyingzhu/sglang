@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
 )
 
 try:
+    from flexkv.common.config import LayerGroupSpec
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
@@ -159,7 +160,17 @@ class FlexKVConnector(BaseKVConnector):
                 f"model_config={model_config}, rank_info={rank_info}"
             )
 
-        # Build unified kv_caches list (MLA vs MHA)
+        # Build unified kv_caches list (MLA vs MHA vs DSv4 multi-pool)
+        # ``self._is_dsv4`` and ``self._dsv4_layer_groups_info`` are populated only
+        # when a ``DeepSeekV4TokenToKVPool`` is detected (its sub-pools each store
+        # KV in 2D packed buffers ``[num_pages, bytes_per_page_padded]`` with a
+        # different compression ratio per group: c4 (CSA) at 4x, c128 (HCA) at
+        # 128x, and an optional c4 indexer at 4x).  The SWA sub-pool is handled
+        # separately further down (matches existing SWA path).
+        self._is_dsv4 = False
+        self._dsv4_layer_groups_info: List[Dict[str, Any]] = []
+        self._dsv4_kvcache = None
+
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers is not None and len(indexer_buffers) > 0:
             logger.info(
@@ -168,16 +179,132 @@ class FlexKVConnector(BaseKVConnector):
                 f"shape={indexer_buffers[0].shape}"
             )
 
-        if hasattr(kvcache, "kv_buffer"):
+        if hasattr(kvcache, "c4_kv_pool"):
+            # ---- DeepSeek V4 multi-pool path ----
+            # DSv4 splits the KV cache across several sub-pools, each with its
+            # own page_size and compression ratio.  We register each sub-pool
+            # as its own ``LayerGroupSpec`` (FlexKV multi-group registration).
+            # The control plane (slot_mapping in full-pool token index space)
+            # is handed to FlexKV unchanged; FlexKV's per-group ``compress_ratio``
+            # in ``LayerGroupSpec`` is what derives sub-mappings during transfer.
+            self._is_dsv4 = True
+            self._dsv4_kvcache = kvcache
+
+            # PP support: ``compression_ratios`` is the FULL model's; the
+            # sub-pool ``kv_buffer`` lists are sized to the current PP stage
+            # only.  Compute layer ids within the stage range so they match
+            # the buffer count, but emit them as absolute layer ids (FlexKV's
+            # LayerGroupSpec invariant: ``layer_indices ⊂ [0, num_layers)``
+            # where ``num_layers`` is the full-model count).
+            compression_ratios = kvcache.compression_ratios
+            stage_start = getattr(kvcache, "_stage_start", 0)
+            stage_end = getattr(kvcache, "_stage_end", len(compression_ratios))
+            c4_layer_ids = [
+                i for i in range(stage_start, stage_end)
+                if compression_ratios[i] == 4
+            ]
+            c128_layer_ids = [
+                i for i in range(stage_start, stage_end)
+                if compression_ratios[i] == 128
+            ]
+
+            # Each entry: dict with keys
+            #   name: human label (logging)
+            #   ratio: compress_ratio (4 / 128)
+            #   layer_ids: original-layer ids belonging to this group
+            #   buffers: list of 2D GPU tensors [num_pages, bytes_per_page_padded]
+            #   bytes_per_token: packed bytes per token in this sub-pool
+            #   sub_page_size: per-token slots per page IN THE SUB-POOL
+            #                  (= full-pool page_size // compress_ratio)
+            self._dsv4_layer_groups_info = []
+            self._dsv4_layer_groups_info.append({
+                "name": "c4",
+                "ratio": 4,
+                "layer_ids": c4_layer_ids,
+                "buffers": kvcache.c4_kv_pool.kv_buffer,
+                "bytes_per_token": kvcache.c4_kv_pool.get_bytes_per_token(),
+                "sub_page_size": kvcache.c4_kv_pool.page_size,
+                "dtype": torch.uint8,
+            })
+            self._dsv4_layer_groups_info.append({
+                "name": "c128",
+                "ratio": 128,
+                "layer_ids": c128_layer_ids,
+                "buffers": kvcache.c128_kv_pool.kv_buffer,
+                "bytes_per_token": kvcache.c128_kv_pool.get_bytes_per_token(),
+                "sub_page_size": kvcache.c128_kv_pool.page_size,
+                "dtype": torch.uint8,
+            })
+
+            # c4_indexer_kv_pool is optional (older DSv4 configs may not have
+            # the indexer split).  It uses the same compress_ratio=4 layer set
+            # as c4_kv_pool but stores indexer K (uint8 packed) instead of KV.
+            if hasattr(kvcache, "c4_indexer_kv_pool"):
+                indexer_pool = kvcache.c4_indexer_kv_pool
+                indexer_buffers_pool = getattr(
+                    indexer_pool, "index_k_with_scale_buffer", None
+                )
+                if indexer_buffers_pool and len(indexer_buffers_pool) > 0:
+                    # Indexer page bytes = page_size * head_dim
+                    #                    + page_size * (head_dim/quant_block) * 4
+                    # Compute per-token bytes from buffer shape so we don't
+                    # duplicate the formula in DeepSeekV4IndexerPool.
+                    sample = indexer_buffers_pool[0]
+                    bytes_per_page = sample.shape[1]
+                    bytes_per_token_idx = bytes_per_page // indexer_pool.page_size
+                    self._dsv4_layer_groups_info.append({
+                        "name": "c4_indexer",
+                        "ratio": 4,
+                        "layer_ids": list(c4_layer_ids),
+                        "buffers": indexer_buffers_pool,
+                        "bytes_per_token": bytes_per_token_idx,
+                        "sub_page_size": indexer_pool.page_size,
+                        "dtype": torch.uint8,
+                    })
+
+            # Build the flat ``kv_caches`` list expected by the registration
+            # path (concatenation of all non-empty group buffers; ordering
+            # must match ``handles_per_group`` at registration time).  Empty
+            # groups (e.g. a PP stage with no c4 layers) are skipped.
+            self._dsv4_layer_groups_info = [
+                gi for gi in self._dsv4_layer_groups_info if gi["buffers"]
+            ]
+            if not self._dsv4_layer_groups_info:
+                raise RuntimeError(
+                    "[FlexKV] DSv4 detected but no non-empty sub-pool groups "
+                    "found on this PP stage. Check stage_start/stage_end and "
+                    "compression_ratios."
+                )
+            kv_caches = []
+            for gi in self._dsv4_layer_groups_info:
+                kv_caches.extend(gi["buffers"])
+
+            # DSv4 uses a separate SWA sub-pool with its own page_size; the
+            # existing SWA path (below, see ``self._swa_kv_pool``) handles it.
+            # Suppress the legacy NSA-indexer code path: DSv4's indexer is
+            # registered via a layer_group instead.
+            indexer_buffers = None
+
+            logger.info(
+                f"[FlexKV] Detected DeepSeekV4TokenToKVPool: "
+                f"groups={[(g['name'], g['ratio'], len(g['layer_ids'])) for g in self._dsv4_layer_groups_info]}, "
+                f"total_layers={len(compression_ratios)}, "
+                f"page_size_full={self.page_size}, "
+                f"swa_pool={'present' if hasattr(kvcache, 'swa_kv_pool') else 'absent'}"
+            )
+        elif hasattr(kvcache, "kv_buffer"):
             # MLA: K and V share the same buffer, register once per layer
             kv_caches = kvcache.kv_buffer
         elif hasattr(kvcache, "k_buffer"):
             # MHA: separate K and V buffers, concat as [k_layers..., v_layers...]
             kv_caches = kvcache.k_buffer + kvcache.v_buffer
         else:
-            raise AttributeError(
-                f"Unsupported KV cache type {type(kvcache).__name__}: "
-                f"expected 'kv_buffer' (MLA/NSA) or 'k_buffer'/'v_buffer' (MHA)."
+            # Other multi-pool layouts are not yet supported by FlexKV's
+            # transfer engine.
+            raise NotImplementedError(
+                f"FlexKV does not yet support KV cache type {type(kvcache).__name__}. "
+                f"Supported: 'kv_buffer' (MLA/NSA), 'k_buffer'/'v_buffer' (MHA), "
+                f"or 'c4_kv_pool' (DeepSeek V4 multi-pool)."
             )
 
         # ---- Node B: Launch TransferManagerOnRemote ----
@@ -1169,9 +1296,20 @@ class FlexKVConnector(BaseKVConnector):
             kv_caches: Unified KV cache tensor list.
                 - MLA: num_layer tensors (K and V share the same buffer).
                 - MHA: 2 * num_layer tensors (K buffers followed by V buffers).
-            indexer_buffers: Optional sparse attention indexer buffers.
+                - DSv4: concatenation of all sub-pool buffers (c4 first, then
+                  c128, then optional c4_indexer); each sub-pool tensor is 2D
+                  ``[num_pages, bytes_per_page_padded]`` uint8.
+            indexer_buffers: Optional sparse attention indexer buffers (NSA path).
+                Mutually exclusive with the DSv4 path (DSv4 routes its indexer
+                via ``self._dsv4_layer_groups_info`` instead).
         """
         assert len(kv_caches) > 0
+
+        # ---- DSv4 multi-pool path ----
+        if self._is_dsv4:
+            self._register_to_server_dsv4(kv_caches)
+            return
+
         assert kv_caches[0].ndim == 3, f"Expected 3D tensor, got shape={kv_caches[0].shape}"
 
         is_mla = self.flexkv_config.model_config.use_mla
@@ -1234,14 +1372,294 @@ class FlexKVConnector(BaseKVConnector):
                     f"= {expected_indexer_blocks} expected blocks"
                 )
 
-        # Register KV caches (and optional indexer buffers) to FlexKV server
-        self.tp_client.register_to_server(
-            kv_caches=kv_caches,
-            kv_layout=gpu_layout,
-            indexer_buffers=indexer_buffers,
-            indexer_layout=indexer_layout,
+        # Register KV caches to FlexKV server.
+        # If NSA indexer buffers are present, register them as an additional
+        # layer-group (matches the multi-group registration API; FlexKV's
+        # register_to_server() does NOT accept ad-hoc indexer_buffers/
+        # indexer_layout kwargs — only kv_layout + layer_groups + gpu_layouts +
+        # handles_per_group).
+        if indexer_buffers is not None and len(indexer_buffers) > 0 and indexer_layout is not None:
+            # Build a 2-group registration: main KV + indexer.
+            main_layer_group = LayerGroupSpec(
+                num_layers=self.rank_info.num_layers_per_pp_stage,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
+                compress_ratio=1,
+                dtype=kv_caches[0].dtype,
+            )
+            indexer_layer_group = LayerGroupSpec(
+                num_layers=len(indexer_buffers),
+                num_kv_heads=indexer_layout.num_head,
+                head_size=indexer_layout.head_size,
+                layer_indices=list(range(len(indexer_buffers))),
+                compress_ratio=1,
+                dtype=indexer_buffers[0].dtype,
+            )
+            # NOTE: Do NOT set self.flexkv_config.model_config.layer_groups here.
+            # ModelConfig is frozen after FlexKVConfig.from_env() / post_init_*.
+            # The server-side TransferManager picks up layer_groups from the
+            # RegisterTPClientRequest and assigns it on its OWN model_config copy
+            # (transfer_manager.py:85-86). Setting it here would just raise
+            # AttributeError("ModelConfig is frozen") on every rank.
+            self.tp_client.register_to_server(
+                kv_caches=list(kv_caches) + list(indexer_buffers),
+                kv_layout=gpu_layout,
+                layer_groups=[main_layer_group, indexer_layer_group],
+                gpu_layouts=[gpu_layout, indexer_layout],
+                handles_per_group=[list(kv_caches), list(indexer_buffers)],
+            )
+            logger.info(
+                "[FlexKV] Registered KV caches + NSA indexer to server "
+                "(2 layer-groups)"
+            )
+        else:
+            self.tp_client.register_to_server(
+                kv_caches=kv_caches,
+                kv_layout=gpu_layout,
+            )
+            logger.info("[FlexKV] Registered KV caches to server")
+
+    def _register_to_server_dsv4(
+        self,
+        kv_caches: List[torch.Tensor],
+    ) -> None:
+        """DeepSeek V4 multi-pool registration path.
+
+        DSv4's GPU KV layout differs structurally from MLA/MHA:
+
+          * KV is split across multiple sub-pools (c4, c128, optional
+            c4_indexer); each sub-pool has its own ``page_size``:
+
+                page_size_full           = self.page_size  (e.g. 128)
+                c4_kv_pool.page_size     = page_size_full // 4
+                c128_kv_pool.page_size   = page_size_full // 128
+
+            Per-token write is at ``compressed_loc = full_loc // ratio``
+            for tokens where ``(full_loc + 1) % ratio == 0``. **At the page
+            level this is a 1:1 mapping**: full_page_id == sub_pool_page_id
+            because consecutive ``page_size_full`` full-pool tokens always
+            land in exactly ``page_size_full // ratio`` consecutive sub-pool
+            tokens, i.e. one sub-pool page.
+
+          * Each sub-pool's ``kv_buffer[layer]`` is a *2D* uint8 tensor of
+            shape ``[num_pages, bytes_per_page_padded]`` where each row
+            packs ``sub_page_size`` tokens of (nope_fp8 + rope_bf16 + scale)
+            into a single contiguous byte vector, and
+            ``bytes_per_page_padded = ceil_div(sub_page_size * 584, 576) * 576``
+            (576-byte alignment).
+
+        We register each sub-pool as one ``LayerGroupSpec`` with:
+            compress_ratio = sub-pool ratio (4 or 128)
+            num_kv_heads   = 1   (DSv4 packs heads into the byte stream)
+            head_size      = effective_per_token_bytes
+                            = bytes_per_page_padded // sub_page_size
+            dtype          = torch.uint8
+
+        and a per-group ``KVCacheLayout`` with:
+            num_block        = sub-pool num_pages
+            tokens_per_block = sub_page_size
+            num_head         = 1
+            head_size        = effective_per_token_bytes
+            is_mla           = True
+
+        With this layout, FlexKV's GPU block_stride
+        (= tokens_per_block * num_kv_heads * head_size * dtype_size
+           = sub_page_size * (bytes_per_page_padded / sub_page_size)
+           = bytes_per_page_padded)
+        exactly matches the sglang DSv4 GPU buffer's actual page stride —
+        no per-token offset translation needed at the byte layout level.
+
+        The slot_mapping passed to ``kv_manager.launch()`` is in full-pool
+        token index space; FlexKV converts it to full-pool page-ids via
+        ``slot[::page_size_full] // page_size_full`` and uses those page-ids
+        directly to index each sub-pool buffer, which is correct because
+        the page-level mapping is 1:1 (see above).
+
+        Limitations:
+            * If ``bytes_per_page_padded`` is not divisible by
+              ``sub_page_size``, the alignment-padding split is ambiguous
+              and we raise. (Holds for typical DSv4 configs because
+              gcd(sub_page_size, 576) typically lets the padded bytes
+              divide evenly per token.)
+            * ``cache_config.tokens_per_block`` (= ``page_size_full``) must
+              be divisible by every group's compress_ratio. FlexKV's
+              KVCacheLayout enforces this.
+            * Indexer compression-state pools and SWA pool are NOT covered
+              by this registration; SWA goes through the existing
+              ``self._swa_kv_pool`` path; indexer compress states stay
+              GPU-only.
+
+        Args:
+            kv_caches: concatenation of all DSv4 sub-pool buffers, in the
+                same group order as ``self._dsv4_layer_groups_info``.
+        """
+        if not self._dsv4_layer_groups_info:
+            raise RuntimeError(
+                "[FlexKV] DSv4 detected but layer_groups_info is empty"
+            )
+
+        is_mla = self.flexkv_config.model_config.use_mla
+        page_size_full = self.page_size
+
+        # Build per-group LayerGroupSpec + KVCacheLayout entries.
+        # ``layer_indices`` here are *original-layer ids* (from
+        # ``compression_ratios``).  Multiple groups can share the same
+        # original layer (e.g. c4 main KV and c4 indexer both attach to
+        # the same CSA layer); FlexKV's ``LayerMemberMap`` handles this.
+        layer_groups: List[LayerGroupSpec] = []
+        gpu_layouts: List[KVCacheLayout] = []
+        handles_per_group: List[List[torch.Tensor]] = []
+        all_gpu_blocks: List[torch.Tensor] = []
+
+        for gi in self._dsv4_layer_groups_info:
+            buffers = gi["buffers"]
+            if not buffers:
+                logger.warning(
+                    f"[FlexKV-DSv4] Skipping empty layer group '{gi['name']}'"
+                )
+                continue
+            buf = buffers[0]
+            assert buf.ndim == 2, (
+                f"[FlexKV-DSv4] group '{gi['name']}' buffer must be 2D "
+                f"[num_pages, bytes_per_page_padded], got shape={buf.shape}"
+            )
+
+            num_pages = buf.shape[0]
+            bytes_per_page_padded = buf.shape[1]
+            sub_page_size = gi["sub_page_size"]
+            bytes_per_token = gi["bytes_per_token"]
+            ratio = gi["ratio"]
+
+            # Effective per-token width including alignment padding split
+            # evenly across the tokens in a page. This is what FlexKV will
+            # use as ``head_size`` so that one block_stride covers exactly
+            # one packed page.
+            #
+            # NOTE: For DSv4 the resulting head_size (e.g. c4: 37440/64=585)
+            # may not be a 16-byte multiple. FlexKV's transfer.cu uses float4
+            # (16-byte) vectorized copies, which require chunk_size aligned
+            # to 16 bytes. We address this in the FlexKV worker by falling
+            # back to a non-vectorized path when stride alignment fails.
+            if bytes_per_page_padded % sub_page_size != 0:
+                raise RuntimeError(
+                    f"[FlexKV-DSv4] group '{gi['name']}': "
+                    f"bytes_per_page_padded={bytes_per_page_padded} is not "
+                    f"divisible by sub_page_size={sub_page_size}. This breaks "
+                    f"FlexKV's stride math (each token must occupy a fixed "
+                    f"byte width). Check DeepSeekV4SingleKVPool.create_buffer "
+                    f"alignment constants (576-byte multiple)."
+                )
+            effective_head_size = bytes_per_page_padded // sub_page_size
+
+            # cache_config.tokens_per_block (= page_size_full) must be
+            # divisible by ratio — FlexKV's KVCacheLayout enforces this for
+            # the CPU multi-group BLOCKFIRST layout.
+            if page_size_full % ratio != 0:
+                raise RuntimeError(
+                    f"[FlexKV-DSv4] group '{gi['name']}': page_size_full="
+                    f"{page_size_full} not divisible by compress_ratio={ratio}. "
+                    f"Choose a sglang page_size that is a multiple of every "
+                    f"DSv4 compression ratio (4 and 128)."
+                )
+
+            # Useful (non-padded) bytes per page — informational only.
+            useful_bytes = sub_page_size * bytes_per_token
+            if useful_bytes != bytes_per_page_padded:
+                logger.info(
+                    f"[FlexKV-DSv4] group '{gi['name']}' has page padding: "
+                    f"useful={useful_bytes}B, padded={bytes_per_page_padded}B "
+                    f"(effective head_size={effective_head_size}B/token)"
+                )
+
+            # Verify all layers in this group have identical shapes
+            for li, b in enumerate(buffers):
+                if b.shape != buf.shape:
+                    raise RuntimeError(
+                        f"[FlexKV-DSv4] group '{gi['name']}' layer {li} has "
+                        f"shape {b.shape}, expected {buf.shape}"
+                    )
+
+            layer_groups.append(LayerGroupSpec(
+                num_layers=len(gi["layer_ids"]),
+                num_kv_heads=1,
+                head_size=effective_head_size,
+                layer_indices=list(gi["layer_ids"]),
+                compress_ratio=ratio,
+                dtype=gi["dtype"],
+            ))
+            gpu_layouts.append(KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(gi["layer_ids"]),
+                num_block=num_pages,
+                tokens_per_block=sub_page_size,
+                num_head=1,
+                head_size=effective_head_size,
+                is_mla=True,
+            ))
+            handles_per_group.append(list(buffers))
+            all_gpu_blocks.extend(buffers)
+
+            logger.info(
+                f"[FlexKV-DSv4] Registered group '{gi['name']}': "
+                f"compress_ratio={ratio}, num_layers={len(gi['layer_ids'])}, "
+                f"num_pages={num_pages}, sub_page_size={sub_page_size}, "
+                f"bytes_per_page_padded={bytes_per_page_padded}, "
+                f"effective_head_size={effective_head_size}, "
+                f"useful_bytes_per_token={bytes_per_token}, "
+                f"layer_indices={gi['layer_ids'][:4]}"
+                f"{'...' if len(gi['layer_ids']) > 4 else ''}"
+            )
+
+        if len(all_gpu_blocks) != len(kv_caches):
+            raise RuntimeError(
+                f"[FlexKV-DSv4] flat buffer count mismatch: "
+                f"groups built {len(all_gpu_blocks)} buffers, "
+                f"but kv_caches has {len(kv_caches)}"
+            )
+
+        # NOTE: Do NOT set self.flexkv_config.model_config.layer_groups here.
+        # ModelConfig is frozen after FlexKVConfig.from_env() / post_init_*.
+        # The server-side TransferManager picks it up from the registration
+        # request and assigns it on its own model_config copy
+        # (transfer_manager.py:85-86). Setting it here raises
+        # AttributeError("ModelConfig is frozen") on every rank.
+
+        # Primary layout (kv_layout arg).
+        # IMPORTANT: TransferManager derives ``num_layers_per_pp_stage`` from
+        # ``primary_layout.num_layer`` (transfer_manager.py:148), which then
+        # propagates to cpu_kv_layout.num_layer and is used as the original
+        # layer-id index space when building LayerMemberMap.
+        # Per-group GPU layouts have GROUP-LOCAL num_layer (e.g. c4 group has
+        # only 21 layers, c128 has 20), but ``layer_indices`` are absolute
+        # layer ids in [0, total_stage_layers).  So ``primary_layout`` MUST
+        # carry the FULL stage layer count, not the first group's count.
+        primary_layout = KVCacheLayout(
+            type=gpu_layouts[0].type,
+            num_layer=self.rank_info.num_layers_per_pp_stage,
+            num_block=gpu_layouts[0].num_block,
+            tokens_per_block=gpu_layouts[0].tokens_per_block,
+            num_head=gpu_layouts[0].num_head,
+            head_size=gpu_layouts[0].head_size,
+            is_mla=gpu_layouts[0].is_mla,
         )
-        logger.info("[FlexKV] Registered KV caches to server")
+
+        logger.info(
+            f"[FlexKV-DSv4] Submitting registration: "
+            f"num_groups={len(layer_groups)}, "
+            f"total_buffers={len(all_gpu_blocks)}, "
+            f"page_size_full={page_size_full}, is_mla={is_mla}"
+        )
+        self.tp_client.register_to_server(
+            kv_caches=all_gpu_blocks,
+            kv_layout=primary_layout,
+            layer_groups=layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group,
+        )
+        logger.info(
+            "[FlexKV-DSv4] Registered DSv4 multi-pool KV caches to server"
+        )
 
     def _init_layer_transfer_components(self):
         if not self.enable_layerwise_transfer:

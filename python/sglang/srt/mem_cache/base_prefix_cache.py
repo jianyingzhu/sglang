@@ -299,9 +299,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def ready_to_load_host_cache(self) -> Any:
         """
-        Notify the cache controller to start the KV cache loading
+        Notify the cache controller to start the KV cache loading.
+
+        Default implementation returns -1 (no consumer task). Caches with
+        async backends (HiRadixCache, ExtendedRadixCache) override this.
         """
-        raise NotImplementedError()
+        return -1
 
     def flush_write_through_acks(self) -> None:
         """Release lock_ref on radix-tree nodes whose write-through has completed.
@@ -313,9 +316,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def check_hicache_events(self) -> Any:
         """
-        Check HiCache related activities to update radix tree and synchronize across TP workers if needed
+        Check HiCache related activities to update radix tree and synchronize across TP workers if needed.
+
+        Default implementation is a no-op for caches that don't support
+        async backend events (e.g., plain RadixCache, SWARadixCache without
+        a KV connector). HiRadixCache and ExtendedRadixCache override this.
         """
-        raise NotImplementedError()
+        return
 
     def take_events(self):
         return []

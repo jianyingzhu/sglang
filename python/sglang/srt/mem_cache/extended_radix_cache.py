@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode, page_align_keys
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -122,11 +122,18 @@ class ExtendedRadixCache(BasePrefixCache):
                 params.req.cached_tokens_extended_device = 0
             return device_match_result
 
-        token_mask = torch.zeros(len(key), dtype=torch.bool)
+        # ``key.token_ids`` may be longer than ``len(key)`` in EAGLE bigram
+        # mode (N raw tokens make N-1 bigrams).  The connector consumes
+        # token_ids and a parallel mask, so both must have the same length —
+        # use ``len(key)`` (the logical bigram count) as the source of truth
+        # and slice token_ids to match.
+        n = len(key)
+        token_ids_for_connector = key.token_ids[:n] if hasattr(key, 'token_ids') else key.token_ids
+        token_mask = torch.zeros(n, dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
         new_hit_length = self._connector.get_new_hit_length(
-            token_ids=key.token_ids,
+            token_ids=token_ids_for_connector,
             token_mask=token_mask,
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
@@ -139,6 +146,7 @@ class ExtendedRadixCache(BasePrefixCache):
             device_indices=device_indices,
             last_device_node=last_device_node,
             last_host_node=last_device_node,
+            best_match_node=last_device_node,
             host_hit_length=new_hit_length,
         )
 
@@ -187,13 +195,27 @@ class ExtendedRadixCache(BasePrefixCache):
         new_node.key = key
         new_node.value = device_indices
         new_node.parent = last_node
-        last_node.children[self._inner_radixtree.get_child_key_fn(new_node.key)] = (
+        last_node.children[new_node.key.child_key(self._inner_radixtree.page_size)] = (
             new_node
         )
-        self._inner_radixtree.evictable_size_ += len(device_indices)
+        # Bookkeeping for evictable size — RadixCache uses 'evictable_size_',
+        # SWARadixCache uses 'full_evictable_size_' (and 'swa_evictable_size_').
+        # Update whichever is present so the counter stays consistent for the
+        # underlying cache implementation.
+        if hasattr(self._inner_radixtree, 'evictable_size_'):
+            self._inner_radixtree.evictable_size_ += len(device_indices)
+        if hasattr(self._inner_radixtree, 'full_evictable_size_'):
+            self._inner_radixtree.full_evictable_size_ += len(device_indices)
+        if hasattr(self._inner_radixtree, 'swa_evictable_size_'):
+            self._inner_radixtree.swa_evictable_size_ += len(device_indices)
         self._inner_radixtree._record_store_event(new_node)
 
-        self._inner_radixtree.inc_lock_ref(new_node)
+        # Capture swa_uuid_for_lock for the matched SWA range so that the
+        # dec_lock_ref in _check_load_completion can pair correctly on
+        # SWARadixCache. Plain RadixCache returns IncLockRefResult without
+        # SWA fields; getattr default keeps this backward-compatible.
+        inc_result = self._inner_radixtree.inc_lock_ref(new_node)
+        load_swa_uuid = getattr(inc_result, 'swa_uuid_for_lock', None)
 
         self._load_queue.append(
             LoadOperation(
@@ -231,8 +253,9 @@ class ExtendedRadixCache(BasePrefixCache):
         if self._connector is not None and is_insert:
             req_id = req.req_pool_idx
             token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-            # Reuse sglang's page_align_keys to truncate to page boundary
-            token_ids = page_align_keys(token_ids, self.page_size)
+            # Truncate to page boundary (page_align_floor equivalent)
+            page_aligned_len = (len(token_ids) // self.page_size) * self.page_size
+            token_ids = token_ids[:page_aligned_len]
             if len(token_ids) > 0 and req_id is not None:
                 cache_to_connector = True
 
@@ -258,9 +281,23 @@ class ExtendedRadixCache(BasePrefixCache):
         if kv_indices is None or kv_indices.numel() == 0:
             return
 
+        # The radix tree may return fewer indices than tokens passed in. Common
+        # causes:
+        #   * EAGLE bigram mode: ``len(key) == len(token_ids) - 1``, so the
+        #     match anchors on N-1 bigrams and ``device_indices`` is sized to
+        #     N-1, then page-aligned (truncating the unmatched tail).
+        #   * Page-alignment in ``match_prefix``: SWARadixCache truncates the
+        #     key to a page-aligned length before traversal.
+        # We cannot store more tokens than we have indices for, so truncate
+        # ``token_ids`` to match ``kv_indices`` length.  If after truncation
+        # nothing remains, skip the store (typical for very short requests).
+        if len(token_ids) > kv_indices.numel():
+            token_ids = token_ids[: kv_indices.numel()]
+        if len(token_ids) == 0:
+            return
         if len(token_ids) != kv_indices.numel():
             logger.warning(
-                "[FlexKV] cache_finished_req: length mismatch! "
+                "[FlexKV] cache_finished_req: irrecoverable length mismatch! "
                 "len(token_ids)=%d, kv_indices.numel()=%d, skipping store",
                 len(token_ids), kv_indices.numel(),
             )
@@ -268,18 +305,25 @@ class ExtendedRadixCache(BasePrefixCache):
 
         # Lock the resolved tree node BEFORE starting async D2H transfer
         # so that evict cannot free these pages while transfer is in flight.
-        self._inner_radixtree.inc_lock_ref(new_last_node)
+        # On SWARadixCache, inc_lock_ref locks both full_lock_ref and a
+        # bounded prefix of swa_lock_ref (up to sliding_window_size from the
+        # leaf). It returns ``IncLockRefResult.swa_uuid_for_lock`` which
+        # MUST be passed to dec_lock_ref so the SWA-side release walks the
+        # exact same range. Plain RadixCache returns the result but ignores
+        # the SWA fields, so this also works there.
+        inc_result = self._inner_radixtree.inc_lock_ref(new_last_node)
+        swa_uuid_for_lock = getattr(inc_result, 'swa_uuid_for_lock', None)
 
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
-        
+
         self._connector.start_store_kv(
             task_id=task_id,
             token_ids=token_ids,
             kv_indices=kv_indices,
         )
 
-        self._ongoing_store_tasks[task_id] = new_last_node
+        self._ongoing_store_tasks[task_id] = (new_last_node, swa_uuid_for_lock)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)
@@ -320,31 +364,56 @@ class ExtendedRadixCache(BasePrefixCache):
     def _check_store_completion(self) -> None:
         completed_ids = self._connector.check_completed_store_tasks()
         for task_id in completed_ids:
-            node = self._ongoing_store_tasks.pop(task_id, None)
-            if node is not None:
+            entry = self._ongoing_store_tasks.pop(task_id, None)
+            if entry is None:
+                continue
+            # Backward-compat: entry may be a bare node OR (node, swa_uuid)
+            if isinstance(entry, tuple):
+                node, swa_uuid = entry
+            else:
+                node, swa_uuid = entry, None
+            # On SWARadixCache, dec_lock_ref needs DecLockRefParams to know
+            # how far up the SWA chain to walk; on plain RadixCache the
+            # extra param is ignored.
+            try:
+                from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+                params = DecLockRefParams(swa_uuid_for_lock=swa_uuid)
+                self._inner_radixtree.dec_lock_ref(node, params)
+            except (ImportError, TypeError):
                 self._inner_radixtree.dec_lock_ref(node)
 
     def _check_load_completion(self) -> None:
         completed_ids = self._connector.check_completed_load_tasks()
         for task_id in completed_ids:
             nodes = self._ongoing_load_tasks.pop(task_id, None)
-            if nodes is not None:
-                for node in nodes:
+            if nodes is None:
+                continue
+            for entry in nodes:
+                # Backward-compat: entry may be a bare node OR (node, swa_uuid)
+                if isinstance(entry, tuple):
+                    node, swa_uuid = entry
+                else:
+                    node, swa_uuid = entry, None
+                try:
+                    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+                    params = DecLockRefParams(swa_uuid_for_lock=swa_uuid)
+                    self._inner_radixtree.dec_lock_ref(node, params)
+                except (ImportError, TypeError):
                     self._inner_radixtree.dec_lock_ref(node)
 
     # -- Pass-through methods --
 
-    def insert(self, key, value=None, **kwargs):
-        return self._inner_radixtree.insert(key, value=value, **kwargs)
+    def insert(self, *args, **kwargs):
+        return self._inner_radixtree.insert(*args, **kwargs)
 
-    def inc_lock_ref(self, node):
-        return self._inner_radixtree.inc_lock_ref(node)
+    def inc_lock_ref(self, *args, **kwargs):
+        return self._inner_radixtree.inc_lock_ref(*args, **kwargs)
 
-    def dec_lock_ref(self, node):
-        return self._inner_radixtree.dec_lock_ref(node)
+    def dec_lock_ref(self, *args, **kwargs):
+        return self._inner_radixtree.dec_lock_ref(*args, **kwargs)
 
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        return self._inner_radixtree.cache_unfinished_req(req, **kwargs)
+    def cache_unfinished_req(self, *args, **kwargs):
+        return self._inner_radixtree.cache_unfinished_req(*args, **kwargs)
 
     def evictable_size(self):
         return self._inner_radixtree.evictable_size()
