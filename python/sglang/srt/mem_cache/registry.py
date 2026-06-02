@@ -41,11 +41,6 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
-    attn_tp_group: Any = None
-    attn_cp_group: Any = None
-    pp_group: Any = None
-    dp_rank: Optional[int] = None
-    attn_cp_rank: int = 0
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
