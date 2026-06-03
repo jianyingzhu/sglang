@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
 
@@ -420,6 +420,70 @@ class ExtendedRadixCache(BasePrefixCache):
 
     def protected_size(self):
         return self._inner_radixtree.protected_size()
+
+    # NOTE: BasePrefixCache gives non-raising DEFAULT implementations for the
+    # methods below (the size getters return 0, supports_* return False).
+    # Because the base class defines them, normal attribute lookup resolves
+    # them BEFORE __getattr__ fires, so __getattr__ never delegates them to the
+    # inner cache and the inner's real value is silently shadowed by the base
+    # default. Every method here is overridden by at least one inner cache we
+    # wrap (SWARadixCache / MambaRadixCache / ...), so it MUST be forwarded
+    # explicitly.
+    #
+    # This shadowing previously caused a phantom "pool memory leak detected"
+    # crash: under hybrid-SWA, invariant_checker and pool_stats_observer read
+    # tree_cache.full_protected_size()/swa_protected_size()/full_evictable_size()
+    # /swa_evictable_size(), got the base-class 0 instead of the inner
+    # SWARadixCache's locked sizes, and mis-counted the locked pages as leaked.
+    def full_evictable_size(self):
+        return self._inner_radixtree.full_evictable_size()
+
+    def swa_evictable_size(self):
+        return self._inner_radixtree.swa_evictable_size()
+
+    def full_protected_size(self):
+        return self._inner_radixtree.full_protected_size()
+
+    def swa_protected_size(self):
+        return self._inner_radixtree.swa_protected_size()
+
+    def supports_swa(self) -> bool:
+        return self._inner_radixtree.supports_swa()
+
+    def supports_mamba(self) -> bool:
+        return self._inner_radixtree.supports_mamba()
+
+    def is_chunk_cache(self) -> bool:
+        return self._inner_radixtree.is_chunk_cache()
+
+    def flush_write_through_acks(self) -> None:
+        return self._inner_radixtree.flush_write_through_acks()
+
+    def sanity_check(self, *args, **kwargs):
+        # An in-flight async store (FlexKV D2H) holds full_lock_ref/swa_lock_ref
+        # on the stored leaf AND every ancestor up to root (see
+        # SWARadixCache.inc_lock_ref, which locks the [leaf, root) path) until
+        # the transfer completes and _check_store_completion runs dec_lock_ref.
+        # The scheduler can go idle and run sanity_check while a store is still
+        # in flight (is_fully_idle does not account for connector store tasks),
+        # so those nodes are legitimately locked at idle. Collect their ids and
+        # exempt them from SWARadixCache's "must be unlocked when idle" assert,
+        # mirroring how UnifiedRadixCache.sanity_check tolerates
+        # ongoing_write_through / ongoing_load_back nodes.
+        inner = self._inner_radixtree
+        if not self._ongoing_store_tasks or not inner.supports_swa():
+            return inner.sanity_check(*args, **kwargs)
+
+        exempt_node_ids: Set[int] = set()
+        root_node = getattr(inner, "root_node", None)
+        for entry in self._ongoing_store_tasks.values():
+            # main2 stores (node, swa_uuid) tuples; tolerate a bare node too.
+            node = entry[0] if isinstance(entry, tuple) else entry
+            walker = node
+            while walker is not None and walker is not root_node:
+                exempt_node_ids.add(walker.id)
+                walker = walker.parent
+        return inner.sanity_check(exempt_node_ids=exempt_node_ids)
 
     def total_size(self):
         return self._inner_radixtree.total_size()

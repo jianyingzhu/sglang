@@ -22,7 +22,7 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 import torch
 from numpy import float64
@@ -288,10 +288,19 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "SWARadixCache"):
+    def sanity_check(
+        self,
+        tree_cache: "SWARadixCache",
+        exempt_node_ids: Optional[Set[int]] = None,
+    ):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
+
+        exempt_node_ids: ids of nodes that are legitimately locked at idle (e.g. a
+        leaf + its ancestors held by an in-flight FlexKV connector store). These
+        skip the "must be unlocked when idle" lock-ref asserts; all other checks
+        still apply.
         """
         try:
             if self.is_swa_list:
@@ -316,12 +325,13 @@ class LRUList:
                 assert (
                     x == x_lru
                 ), f"Incorrect LRU list, {self.is_swa_list=}, x: {x.id=} != x_lru: {x_lru.id=}"
-                assert (
-                    x_lru.full_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
-                assert (
-                    x_lru.swa_lock_ref == 0
-                ), f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                if exempt_node_ids is None or x_lru.id not in exempt_node_ids:
+                    assert (
+                        x_lru.full_lock_ref == 0
+                    ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
+                    assert (
+                        x_lru.swa_lock_ref == 0
+                    ), f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
                 x_lru = getattr(x, self.prv)
 
             if self.is_swa_list:
@@ -812,9 +822,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
             node = node.parent
 
-    def sanity_check(self):
-        self.full_lru_list.sanity_check(self)
-        self.swa_lru_list.sanity_check(self)
+    def sanity_check(self, exempt_node_ids: Optional[Set[int]] = None):
+        self.full_lru_list.sanity_check(self, exempt_node_ids)
+        self.swa_lru_list.sanity_check(self, exempt_node_ids)
 
     def evictable_size(self) -> Tuple[int, int]:
         # Note: use full_evictable_size() and swa_evictable_size() instead.
