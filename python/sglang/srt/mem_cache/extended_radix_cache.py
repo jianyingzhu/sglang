@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams, InsertParams, MatchPrefixParams
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -153,12 +153,25 @@ class ExtendedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams
-    ) -> None:
+    ):
+        """Reserve GPU slots, build a new tree node, and queue the H2D op.
+
+        Returns (new_indices, last_node) tuple — the schedule_policy caller
+        unpacks this directly:
+            new_indices, req.last_node = tree_cache.init_load_back(...)
+        On any early-exit path we return (empty_tensor, req.last_node) to
+        keep that contract intact.
+        """
         req = params.req
         mem_quota = params.mem_quota
 
+        # Empty tensor sized to req.prefix_indices' device, so torch.cat works.
+        empty_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self._inner_radixtree.device
+        )
+
         if self._connector is None:
-            return
+            return empty_indices, req.last_node
 
         host_hit_length = req.host_hit_length
 
@@ -166,49 +179,202 @@ class ExtendedRadixCache(BasePrefixCache):
             mem_quota is not None and host_hit_length > mem_quota
         ):
             self._connector.release_load_state(req.rid)
-            return
+            return empty_indices, req.last_node
 
-        device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
-            host_hit_length
-        )
+        # Allocate GPU slots for host_hit_length tokens. Three allocator regimes:
+        #   * page_size == 1: plain RadixCache / SWARadixCache w/ token-level alloc.
+        #     `.alloc(N)` works directly.
+        #   * page_size  > 1, no SWA: DSv4 paged allocator without window — use
+        #     `alloc_extend()` for the whole hit length.
+        #   * page_size  > 1, hybrid SWA (DSv4): full layers get the whole hit,
+        #     but SWA layers only get the trailing window. We MUST call
+        #     `alloc_extend_swa_tail(extend_num_tokens=H, swa_tail_len=window)`
+        #     because the SWA pool is sized to ~window-per-request and
+        #     never has room for H tokens of SWA data — and FlexKV only stored
+        #     `window` tokens of SWA data on the host side anyway.
+        allocator = self._inner_radixtree.token_to_kv_pool_allocator
+        page_size = getattr(allocator, "page_size", 1) or 1
+        # Pull window size from the connector if it exposes one (FlexKV does).
+        window_size = getattr(self._connector, "_swa_window_size", 0) or 0
+        # Detect hybrid-SWA paged allocator by the alloc_extend_swa_tail method.
+        has_swa_tail = hasattr(allocator, "alloc_extend_swa_tail")
+
+        def _alloc_paged():
+            # prefix_lens is the device-cached length so far. host_hit_length is
+            # appended after that.
+            gpu_prefix_len = int(req.prefix_indices.numel())
+            seq_len = gpu_prefix_len + host_hit_length
+            device = self._inner_radixtree.device
+            prefix_lens = torch.tensor([gpu_prefix_len], dtype=torch.int64, device=device)
+            prefix_lens_cpu = torch.tensor([gpu_prefix_len], dtype=torch.int64, device="cpu")
+            seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
+            seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64, device="cpu")
+            # last_loc: previous token's slot index, or -1 sentinel when empty.
+            if gpu_prefix_len > 0:
+                last_loc = req.prefix_indices[-1:].to(device=device, dtype=torch.int64)
+            else:
+                last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            if has_swa_tail and window_size > 0:
+                # Hybrid SWA: only allocate `window` SWA slots regardless of how
+                # many full slots we need. Cap window at host_hit_length so the
+                # allocator's `0 <= swa_tail_len <= extend_num_tokens` assertion
+                # holds when the hit is shorter than the window.
+                swa_tail_len = min(window_size, host_hit_length)
+                # Round swa_tail_len down to a page multiple — alloc_extend_swa_tail
+                # converts it to ceil(num_swa_pages) which would over-allocate the
+                # SWA pool by up to a page on partial-page tails. Page-align here
+                # so the FlexKV-stored window matches exactly.
+                if swa_tail_len % page_size != 0:
+                    swa_tail_len = (swa_tail_len // page_size) * page_size
+                if swa_tail_len == 0:
+                    swa_tail_len = page_size  # at least one page
+                return allocator.alloc_extend_swa_tail(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    host_hit_length,
+                    swa_tail_len,
+                )
+            return allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                host_hit_length,
+            )
+
+        def _do_alloc():
+            if page_size == 1:
+                return allocator.alloc(host_hit_length)
+            # Page-aligned paged allocator path
+            if host_hit_length % page_size != 0:
+                logger.warning(
+                    "[FlexKV] host_hit_length=%d not page-aligned (page_size=%d), "
+                    "skipping H2D for rid=%s",
+                    host_hit_length, page_size, req.rid,
+                )
+                return None
+            return _alloc_paged()
+
+        device_indices = _do_alloc()
         if device_indices is None:
             self.evict(EvictParams(num_tokens=host_hit_length))
-            device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
-                host_hit_length
-            )
+            device_indices = _do_alloc()
         if device_indices is None:
             logger.warning(
                 "Failed to allocate %d GPU slots for external load",
                 host_hit_length,
             )
             self._connector.release_load_state(req.rid)
-            return
+            return empty_indices, req.last_node
 
         gpu_cached_len = len(req.prefix_indices)
+        # Sanity-check the effective length that ``_inner_radixtree.insert``
+        # will keep in the tree.  insert() applies two transforms:
+        #   1. EAGLE bigram view: ``len(key) -> len(key) - 1`` when is_eagle.
+        #   2. page_aligned trim: ``len(key) -> (len(key) // page_size) * page_size``.
+        # If ``effective_len`` is 0, the insert is a no-op and re-match would
+        # land on root; bail cleanly to avoid wasting a transfer.
+        #
+        # We do NOT pre-trim ``device_indices`` to ``effective_len``: the
+        # connector already prepared the FlexKV transfer graph with
+        # ``host_hit_length`` source blocks, and shrinking the destination
+        # mapping would crash with ``src_block_ids.size != dst_block_ids.size``
+        # in the worker. Instead we mirror normal sglang prefill: pass the
+        # FULL ``device_indices`` to the load op, let ``insert`` do its
+        # internal trim, and rely on the trailing slots being soft-locked
+        # by ``req.prefix_indices`` (the same way they are after a normal
+        # paged prefill — those slots are "allocator-allocated, not
+        # tree-tracked" and stay alive for the lifetime of the request).
+        is_eagle = bool(getattr(self._inner_radixtree, 'is_eagle', False))
+        effective_len = host_hit_length - (1 if is_eagle else 0)
+        if page_size > 1:
+            effective_len = (effective_len // page_size) * page_size
+        if effective_len <= 0:
+            logger.warning(
+                "[FlexKV] init_load_back: host_hit_length=%d trims to 0 after "
+                "is_eagle=%s + page_align(%d) for rid=%s; rolling back alloc.",
+                host_hit_length, is_eagle, page_size, req.rid,
+            )
+            try:
+                allocator.free(device_indices)
+            except Exception:
+                pass
+            self._connector.release_load_state(req.rid)
+            return empty_indices, req.last_node
+
         key = RadixKey(
             token_ids=req.fill_ids[gpu_cached_len : gpu_cached_len + host_hit_length],
             extra_key=req.extra_key,
         )
 
-        last_node = req.last_node
-        new_node = TreeNode()
-        new_node.key = key
-        new_node.value = device_indices
-        new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self._inner_radixtree.page_size)] = (
-            new_node
+        # Delegate node creation to the inner cache's insert() API. This is
+        # important because:
+        #   * SWARadixCache uses its own TreeNode subclass with full_lock_ref/
+        #     swa_lock_ref/swa_uuid/swa_prev/swa_next fields. Manually creating
+        #     a generic radix_cache.TreeNode would crash inc_lock_ref with
+        #     AttributeError: 'TreeNode' object has no attribute 'full_lock_ref'.
+        #   * insert() correctly updates lru_list, evictable_size_, kv events,
+        #     splits parent nodes, etc. — none of which we want to re-implement.
+        #
+        # After insert, we re-match the same key under root to find the new
+        # leaf node we just created (or the merged leaf if the prefix already
+        # existed). That node is what we lock and queue for H2D.
+        try:
+            self._inner_radixtree.insert(
+                InsertParams(
+                    key=key,
+                    value=device_indices,
+                    prev_prefix_len=gpu_cached_len,
+                )
+            )
+        except TypeError:
+            # Fallback for caches whose insert() takes positional args
+            self._inner_radixtree.insert(InsertParams(key=key, value=device_indices))
+
+        # Re-match the full prefix path so we get the actual leaf node.
+        # Use a fresh key starting from root with the same token_ids that
+        # are now in the tree, so the match traverses to the new leaf.
+        #
+        # IMPORTANT: pass the *original* host_hit_length tokens (not
+        # effective_len), because match_prefix internally re-applies the
+        # same bigram + page_align transform that insert did. Passing only
+        # effective_len tokens would shrink AGAIN inside match_prefix
+        # (effective_len -> effective_len - 1 (bigram) -> page_align), and
+        # match could fall short of the leaf we just created.
+        full_key = RadixKey(
+            token_ids=req.fill_ids[: gpu_cached_len + host_hit_length],
+            extra_key=req.extra_key,
         )
-        # Bookkeeping for evictable size — RadixCache uses 'evictable_size_',
-        # SWARadixCache uses 'full_evictable_size_' (and 'swa_evictable_size_').
-        # Update whichever is present so the counter stays consistent for the
-        # underlying cache implementation.
-        if hasattr(self._inner_radixtree, 'evictable_size_'):
-            self._inner_radixtree.evictable_size_ += len(device_indices)
-        if hasattr(self._inner_radixtree, 'full_evictable_size_'):
-            self._inner_radixtree.full_evictable_size_ += len(device_indices)
-        if hasattr(self._inner_radixtree, 'swa_evictable_size_'):
-            self._inner_radixtree.swa_evictable_size_ += len(device_indices)
-        self._inner_radixtree._record_store_event(new_node)
+        match_result = self._inner_radixtree.match_prefix(
+            MatchPrefixParams(key=full_key)
+        )
+        new_node = match_result.last_device_node
+        if new_node is None or new_node is getattr(self._inner_radixtree, 'root_node', None):
+            logger.warning(
+                "[FlexKV] init_load_back: re-match returned root for rid=%s, "
+                "host_hit_length=%d. Releasing load state and rolling back GPU alloc.",
+                req.rid, host_hit_length,
+            )
+            try:
+                allocator.free(device_indices)
+            except Exception:
+                pass
+            self._connector.release_load_state(req.rid)
+            return empty_indices, req.last_node
+
+        # NOTE: device_indices may be longer than match_result.device_indices
+        # by up to one page when is_eagle + page_size > 1 — that's normal
+        # sglang behavior (the trailing partial page is not in the tree but
+        # is held alive by req.prefix_indices for the request's forward).
+        # The full device_indices is passed to the connector load op (so
+        # FlexKV can H2D into all allocated slots, matching its src graph)
+        # and to req.prefix_indices (so model forward sees them all).
+        # ``new_node`` only reflects the in-tree slots, which is correct
+        # for the lock_ref protection.
 
         # Capture swa_uuid_for_lock for the matched SWA range so that the
         # dec_lock_ref in _check_load_completion can pair correctly on
@@ -224,9 +390,20 @@ class ExtendedRadixCache(BasePrefixCache):
                 node=new_node,
             )
         )
+        # Track the (node, swa_uuid) pair keyed by op identity so
+        # ready_to_load_host_cache can pair load_ops with their swa_uuids
+        # when stashing into _ongoing_load_tasks. Using id() of the
+        # LoadOperation works because load_ops live until ready_to_load
+        # transfers them to _ongoing_load_tasks (then we drop this).
+        if not hasattr(self, '_load_queue_swa_uuids'):
+            self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
+        self._load_queue_swa_uuids[id(self._load_queue[-1])] = load_swa_uuid
 
         req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
         req.last_node = new_node
+        # Match the (new_indices, last_node) contract that schedule_policy.add_one_req
+        # expects.
+        return device_indices, new_node
 
     def ready_to_load_host_cache(self) -> int:
         if self._connector is None or not self._load_queue:
@@ -237,8 +414,15 @@ class ExtendedRadixCache(BasePrefixCache):
 
         self._connector.start_load_kv(task_id, self._load_queue)
 
-        nodes = [op.node for op in self._load_queue]
-        self._ongoing_load_tasks[task_id] = nodes
+        # Pair each (node, swa_uuid) so _check_load_completion can pass the
+        # right swa_uuid_for_lock to dec_lock_ref. Without the swa_uuid,
+        # SWARadixCache.dec_lock_ref walks the SWA chain to root which can
+        # underflow swa_lock_ref or hit ``dec_lock_ref on swa_tombstone node``.
+        uuid_map = getattr(self, '_load_queue_swa_uuids', {})
+        nodes_with_uuid = [
+            (op.node, uuid_map.pop(id(op), None)) for op in self._load_queue
+        ]
+        self._ongoing_load_tasks[task_id] = nodes_with_uuid
 
         self._load_queue.clear()
         return task_id

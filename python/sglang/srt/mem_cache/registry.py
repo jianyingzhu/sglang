@@ -192,6 +192,40 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 kv_connector_cls_name,
             )
 
+            # Wire the connector's layer-done counter into tp_worker so that
+            # ``scheduler.set_hicache_consumer(batch.hicache_consumer_index)``
+            # rotates the consumer pointer on it after each layerwise H2D.
+            # Without this, the producer ring (3 slots) fills up after 3 H2D
+            # tasks and ``update_producer`` asserts
+            # "Producer event should be finished before reuse".
+            #
+            # We piggy-back on ``register_hicache_layer_transfer_counter``
+            # because:
+            #   * the scheduler already stores ``ready_to_load_host_cache()``'s
+            #     producer_id in ``batch.hicache_consumer_index``;
+            #   * tp_worker.set_hicache_consumer dispatches that index to the
+            #     registered counter; and
+            #   * with ``enable_hierarchical_cache=False`` (mutually exclusive
+            #     with kv_connector_cls in current configs), this slot is free.
+            counter = getattr(connector, "layer_done_counter", None)
+            if counter is not None:
+                tp_worker = ctx.tp_worker
+                if tp_worker is not None and hasattr(
+                    tp_worker, "register_hicache_layer_transfer_counter"
+                ):
+                    tp_worker.register_hicache_layer_transfer_counter(counter)
+                    logger.info(
+                        "KV connector counter registered with tp_worker for "
+                        "consumer-side rotation."
+                    )
+                else:
+                    logger.warning(
+                        "KV connector exposes layer_done_counter but tp_worker "
+                        "is missing register_hicache_layer_transfer_counter; "
+                        "producer ring will run out after %d tasks.",
+                        getattr(counter, "num_counters", 3),
+                    )
+
     streaming_wrapped = False
     if (
         ctx.server_args.enable_streaming_session
