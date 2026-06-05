@@ -669,21 +669,39 @@ class FlexKVConnector(BaseKVConnector):
             fkv_tid = self._pending_loads.pop(op.rid, -1)
             if fkv_tid < 0:
                 continue
+            # HiCache-aligned SWA restore for init_load_back: mapping for the
+            # trailing window was set by alloc_extend_swa_tail before this
+            # call (cf. unified SWA commit_hicache_transfer +
+            # set_full_to_swa_mapping). Restore host SWA into mapped GPU
+            # slots before launching full-layer H2D.
+            had_pending_swa_restore = op.rid in self._pending_swa_token_ids
+            if had_pending_swa_restore:
+                self._do_swa_restore_for_op(op)
             flexkv_task_ids.append(fkv_tid)
             indices = op.device_indices
             slot_mapping_cpu = indices.cpu() if indices.is_cuda else indices
             slot_mapping_cpu = slot_mapping_cpu.to(torch.int64)
             slot_mappings.append(slot_mapping_cpu)
+            try:
+                from flexkv.common.debug import summarize_block_ids_from_slots
 
-        # SWA: Restore sliding window data to GPU before main KV load
-        # This ensures SWA data is available when the model forward starts.
-        if self._swa_kv_pool is not None and hasattr(self, '_pending_swa_token_ids'):
-            logger.info(
-                f"[FlexKV-SWA] start_load_kv: pending_swa_count={len(self._pending_swa_token_ids)}, "
-                f"load_ops_count={len(load_ops)}"
-            )
-            for op in load_ops:
-                self._do_swa_restore_for_op(op)
+                block_stats = summarize_block_ids_from_slots(
+                    slot_mapping_cpu, self.page_size
+                )
+                logger.info(
+                    f"[FlexKV-SEGV-DEBUG] start_load_kv rid={op.rid}, fkv_tid={fkv_tid}, "
+                    f"device_indices_count={int(indices.numel())}, "
+                    f"slot_min={block_stats.get('slot_min', 'n/a')}, "
+                    f"slot_max={block_stats.get('slot_max', 'n/a')}, "
+                    f"block_count={block_stats.get('block_count', 0)}, "
+                    f"block_min={block_stats.get('block_min', 'n/a')}, "
+                    f"block_max={block_stats.get('block_max', 'n/a')}, "
+                    f"pending_swa_restore={had_pending_swa_restore}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[FlexKV-SEGV-DEBUG] start_load_kv stats failed rid={op.rid}: {e}"
+                )
 
         logger.debug(f"[FlexKV] start_load_kv: resolved {len(flexkv_task_ids)} flexkv tasks")
         if not flexkv_task_ids:
@@ -855,6 +873,27 @@ class FlexKVConnector(BaseKVConnector):
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping = filtered.cpu() if filtered.is_cuda else filtered
                 slot_mapping = slot_mapping.to(torch.int64)
+                try:
+                    from flexkv.common.debug import summarize_block_ids_from_slots
+
+                    store_stats = summarize_block_ids_from_slots(
+                        slot_mapping, self.page_size
+                    )
+                    logger.info(
+                        f"[FlexKV-SEGV-DEBUG] start_store_kv launch D2H "
+                        f"task_id={task_id}, fkv_task_id={fkv_task_id}, "
+                        f"token_count={len(token_ids_np)}, "
+                        f"unmatched_count={int(unmatched_mask.sum())}, "
+                        f"slot_min={store_stats.get('slot_min', 'n/a')}, "
+                        f"slot_max={store_stats.get('slot_max', 'n/a')}, "
+                        f"block_count={store_stats.get('block_count', 0)}, "
+                        f"block_min={store_stats.get('block_min', 'n/a')}, "
+                        f"block_max={store_stats.get('block_max', 'n/a')}"
+                    )
+                except Exception as log_err:
+                    logger.warning(
+                        f"[FlexKV-SEGV-DEBUG] start_store_kv stats failed task_id={task_id}: {log_err}"
+                    )
 
                 self.kv_manager.launch(
                     task_ids=[fkv_task_id], slot_mappings=[slot_mapping]

@@ -136,6 +136,13 @@ class FakePagedAllocator:
     def available_size(self):
         return self._total - self._next
 
+    def full_available_size(self):
+        return self.available_size()
+
+    def swa_available_size(self):
+        cap = self._swa_capacity if self._swa_capacity is not None else self._total
+        return max(0, cap - min(self._next, cap))
+
     def backup_state(self):
         return self._next
 
@@ -945,6 +952,33 @@ class TestSignalDenseLayersReady(unittest.TestCase):
                     os.read(fd, 8)
             finally:
                 fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+
+class TestExtendedRadixCacheOOMDiagnostics(unittest.TestCase):
+    """Regression: OOM paths must not raise via evictable_size / diag strings."""
+
+    def test_wrapper_evictable_and_available_str(self):
+        inner, allocator = _make_swa_cache()
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=inner.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=inner.page_size,
+            is_eagle=False,
+            sliding_window_size=256,
+        )
+        cache = ExtendedRadixCache(
+            params, connector=FakeConnector(), inner_cache=inner
+        )
+        self.assertEqual(cache.evictable_size(), inner.full_evictable_size())
+        diag = cache.available_and_evictable_str()
+        self.assertIn("Available full tokens", diag)
+        self.assertIn("Available swa tokens", diag)
+
+        from sglang.srt.mem_cache.common import available_and_evictable_str
+
+        helper_diag = available_and_evictable_str(cache)
+        self.assertIn("full_available_size", helper_diag)
 
 
 if __name__ == "__main__":

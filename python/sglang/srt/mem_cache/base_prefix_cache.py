@@ -361,6 +361,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return not self.is_chunk_cache()
 
     def available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        allocator = self.token_to_kv_pool_allocator
+        if self.supports_swa():
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
+            full_evictable_size = self.full_evictable_size()
+            swa_evictable_size = self.swa_evictable_size()
+            return (
+                f"Available full tokens: {full_available_size + full_evictable_size} "
+                f"({full_available_size=} + {full_evictable_size=})\n"
+                f"Available swa tokens: {swa_available_size + swa_evictable_size} "
+                f"({swa_available_size=} + {swa_evictable_size=})\n"
+            )
+        available_size = allocator.available_size()
         evictable_size = self.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+        return (
+            f"Available tokens: {available_size + evictable_size} "
+            f"({available_size=} + {evictable_size=})\n"
+        )

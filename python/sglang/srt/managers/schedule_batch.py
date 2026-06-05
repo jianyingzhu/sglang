@@ -2718,6 +2718,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_tree_cache():
+                    # Radix cache extend: evict SWA tokens that are outside the sliding
+                    # window for already-running requests (those beyond index 0 in the
+                    # batch, i.e., the ones that were already in flight before this
+                    # extend batch). New requests (extend_batch_idx == 0) have not yet
+                    # written their KV, so nothing to evict yet.
+                    if req.extend_batch_idx >= 1:
+                        pre_len = self.prefix_lens[idx]
+                        self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

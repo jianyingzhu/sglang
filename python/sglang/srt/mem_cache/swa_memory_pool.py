@@ -627,12 +627,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
-    def free_swa(self, free_index: torch.Tensor):
+    def count_mapped_swa_slots(self, full_indices: torch.Tensor) -> int:
+        """Return how many SWA-pool slots are referenced by *full_indices*."""
+        if full_indices.numel() == 0:
+            return 0
+        swa_indices = self.full_to_swa_index_mapping[full_indices]
+        return int((swa_indices > 0).sum().item())
+
+    def free_swa(self, free_index: torch.Tensor) -> int:
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        n = int(swa_indices.numel())
+        if n > 0:
+            self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+        return n
 
     def backup_state(self):
         return [

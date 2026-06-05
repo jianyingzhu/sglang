@@ -380,6 +380,17 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ), "sliding_window_size must be set for SWARadixCache"
         return True
 
+    def _swa_slots_in_value(self, value: torch.Tensor) -> int:
+        """SWA-pool slots referenced by full-layer indices in *value*.
+
+        ``alloc_extend_swa_tail`` (FlexKV load-back) only maps the trailing
+        window; using ``len(value)`` over-counts eviction and metrics.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        if hasattr(allocator, "count_mapped_swa_slots"):
+            return allocator.count_mapped_swa_slots(value)
+        return len(value)
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -590,11 +601,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 # 1. free node kv indices, evict full and swa tokens
                 self._record_remove_event(x)
+                swa_slots = (
+                    self._swa_slots_in_value(x.value) if not x.swa_tombstone else 0
+                )
                 self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
                 if not x.swa_tombstone:
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += swa_slots
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -628,26 +642,26 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_num_evicted += swa_freed
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
                     self.swa_lru_list.remove_node(x)
 
                     # 3. tombstone the node
-                    self._tombstone_internal_node(x)
+                    self._tombstone_internal_node(x, swa_slots=swa_freed)
                 elif x.full_lock_ref > 0:
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
                     # tombstoned leaf. Treat it like an internal tombstone.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_num_evicted += swa_freed
 
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
                     self.swa_lru_list.remove_node(x)
 
-                    self.swa_evictable_size_ -= len(x.value)
+                    self.swa_evictable_size_ -= swa_freed
                     x.swa_tombstone = True
                 else:
                     assert (
@@ -655,9 +669,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
                     self._record_remove_event(x)
+                    swa_slots = self._swa_slots_in_value(x.value)
                     self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
+                    swa_num_evicted += swa_slots
 
                     # 2. get the next node, update the lru lists
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
@@ -706,11 +721,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert (
                     not node.swa_tombstone
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
+                swa_slots = self._swa_slots_in_value(node.value)
                 if node.swa_lock_ref == 0:
-                    self.swa_evictable_size_ -= len(node.value)
-                    self.swa_protected_size_ += len(node.value)
+                    self.swa_evictable_size_ -= swa_slots
+                    self.swa_protected_size_ += swa_slots
                 node.swa_lock_ref += 1
-                swa_lock_size += len(node.value)
+                swa_lock_size += swa_slots
                 if swa_lock_size >= self.sliding_window_size:
                     if node.swa_uuid is None:
                         node.swa_uuid = gen_swa_uuid()
@@ -757,8 +773,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
 
                 if node.swa_lock_ref == 1:
-                    self.swa_evictable_size_ += len(node.value)
-                    self.swa_protected_size_ -= len(node.value)
+                    swa_slots = self._swa_slots_in_value(node.value)
+                    self.swa_evictable_size_ += swa_slots
+                    self.swa_protected_size_ -= swa_slots
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
@@ -804,7 +821,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
 
             if node.swa_lock_ref == 1:
-                self.swa_protected_size_ -= len(node.value)
+                swa_slots = self._swa_slots_in_value(node.value)
+                self.swa_protected_size_ -= swa_slots
                 if len(node.children) == 0:
                     # Leaf: free SWA pool slots and tombstone, and remove from
                     # swa_lru_list so SWA-eviction won't pick this tombstoned
@@ -815,7 +833,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     node.swa_tombstone = True
                 else:
                     # Internal: standard protected -> evictable.
-                    self.swa_evictable_size_ += len(node.value)
+                    self.swa_evictable_size_ += swa_slots
             node.swa_lock_ref -= 1
 
             if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
@@ -826,9 +844,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.full_lru_list.sanity_check(self, exempt_node_ids)
         self.swa_lru_list.sanity_check(self, exempt_node_ids)
 
-    def evictable_size(self) -> Tuple[int, int]:
-        # Note: use full_evictable_size() and swa_evictable_size() instead.
-        raise NotImplementedError
+    def evictable_size(self) -> int:
+        # Legacy single-pool callers use full-attention evictable only.
+        # Hybrid scheduling should call full_evictable_size() / swa_evictable_size().
+        return self.full_evictable_size_
 
     def full_evictable_size(self) -> int:
         return self.full_evictable_size_
@@ -836,9 +855,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.swa_evictable_size_
 
-    def protected_size(self) -> Tuple[int, int]:
-        # Note: use full_protected_size() and swa_protected_size() instead.
-        raise NotImplementedError
+    def protected_size(self) -> int:
+        return self.full_protected_size_
 
     def full_protected_size(self) -> int:
         # protected size refers to the size of the full cache that is locked
@@ -1154,7 +1172,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         node.value = value[:prefix_len].clone()
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += len(node.value)
+                        self.swa_evictable_size_ += self._swa_slots_in_value(
+                            node.value
+                        )
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
@@ -1168,7 +1188,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += len(node.value)
+                        self.swa_evictable_size_ += self._swa_slots_in_value(
+                            node.value
+                        )
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
                         self.token_to_kv_pool_allocator.free(value[:prefix_len])
@@ -1245,7 +1267,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.full_evictable_size_ += len(value)
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
-            self.swa_evictable_size_ += len(value)
+            self.swa_evictable_size_ += self._swa_slots_in_value(value)
         self._record_store_event(new_node)
         return new_node
 
@@ -1282,12 +1304,18 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # Tombstoned leaves were never (re-)added to swa_lru_list and were
         # already removed from swa_evictable_size_ when they were tombstoned.
         if not node.swa_tombstone:
-            self.swa_evictable_size_ -= len(node.key)
+            self.swa_evictable_size_ -= self._swa_slots_in_value(node.value)
 
-    def _tombstone_internal_node(self, node: TreeNode) -> None:
+    def _tombstone_internal_node(
+        self, node: TreeNode, *, swa_slots: int | None = None
+    ) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
-        self.swa_evictable_size_ -= len(node.key)
+        self.swa_evictable_size_ -= (
+            swa_slots
+            if swa_slots is not None
+            else self._swa_slots_in_value(node.value)
+        )
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (

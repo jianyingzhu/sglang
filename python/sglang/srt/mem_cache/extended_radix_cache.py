@@ -259,14 +259,33 @@ class ExtendedRadixCache(BasePrefixCache):
                 return None
             return _alloc_paged()
 
+        swa_alloc_need = host_hit_length
+        if has_swa_tail and window_size > 0 and page_size > 1:
+            swa_tail_len = min(window_size, host_hit_length)
+            if swa_tail_len % page_size != 0:
+                swa_tail_len = (swa_tail_len // page_size) * page_size
+            if swa_tail_len == 0:
+                swa_tail_len = page_size
+            swa_alloc_need = swa_tail_len
+
         device_indices = _do_alloc()
         if device_indices is None:
-            self.evict(EvictParams(num_tokens=host_hit_length))
+            from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+            evict_from_tree_cache(
+                self,
+                host_hit_length,
+                swa_num_tokens=swa_alloc_need,
+            )
             device_indices = _do_alloc()
         if device_indices is None:
+            from sglang.srt.mem_cache.common import available_and_evictable_str
+
             logger.warning(
-                "Failed to allocate %d GPU slots for external load",
+                "Failed to allocate %d GPU slots for external load (swa_need=%d). %s",
                 host_hit_length,
+                swa_alloc_need,
+                available_and_evictable_str(self),
             )
             self._connector.release_load_state(req.rid)
             return empty_indices, req.last_node
@@ -600,10 +619,22 @@ class ExtendedRadixCache(BasePrefixCache):
         return self._inner_radixtree.cache_unfinished_req(*args, **kwargs)
 
     def evictable_size(self):
-        return self._inner_radixtree.evictable_size()
+        inner = self._inner_radixtree
+        if inner.supports_swa():
+            return inner.full_evictable_size()
+        return inner.evictable_size()
 
     def protected_size(self):
-        return self._inner_radixtree.protected_size()
+        inner = self._inner_radixtree
+        if inner.supports_swa():
+            return inner.full_protected_size()
+        return inner.protected_size()
+
+    def available_and_evictable_str(self) -> str:
+        inner = self._inner_radixtree
+        if hasattr(inner, "available_and_evictable_str"):
+            return inner.available_and_evictable_str()
+        return super().available_and_evictable_str()
 
     # NOTE: BasePrefixCache gives non-raising DEFAULT implementations for the
     # methods below (the size getters return 0, supports_* return False).
