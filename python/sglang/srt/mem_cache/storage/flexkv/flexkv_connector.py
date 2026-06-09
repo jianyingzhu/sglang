@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
 )
 
 try:
-    from flexkv.common.config import LayerGroupSpec
+    from flexkv.common.config import LayerGroupSpec, recompute_cache_block_counts
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
@@ -322,6 +322,12 @@ class FlexKVConnector(BaseKVConnector):
                 f"[FlexKV] Launched TransferManagerOnRemote on node_rank={rank_info.node_rank}"
                 f"{self._rank_label}"
             )
+
+        # Size CPU/SSD pools from real layer_groups before CacheEngine / Transfer
+        # subprocess start.  DSv4 and NSA indexer layouts are known here from
+        # GPU buffers; without this step mempool uses the uniform estimate
+        # (too many logical blocks vs the physical StorageEngine buffer).
+        self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_buffers)
 
         if self._sync_ctx.is_sync_leader:
             self.kv_manager = KVManager(
@@ -1469,6 +1475,98 @@ class FlexKVConnector(BaseKVConnector):
         except Exception as e:
             logger.error("[FlexKV] wait task failed: %s", e, exc_info=True)
             return False
+
+    def _build_dsv4_layer_group_specs(self) -> List[LayerGroupSpec]:
+        """Build LayerGroupSpec list from detected DSv4 sub-pool metadata."""
+        layer_groups: List[LayerGroupSpec] = []
+        for gi in self._dsv4_layer_groups_info:
+            buf = gi["buffers"][0]
+            bytes_per_page_padded = buf.shape[1]
+            sub_page_size = gi["sub_page_size"]
+            if bytes_per_page_padded % sub_page_size != 0:
+                raise RuntimeError(
+                    f"[FlexKV-DSv4] group '{gi['name']}': "
+                    f"bytes_per_page_padded={bytes_per_page_padded} is not "
+                    f"divisible by sub_page_size={sub_page_size}"
+                )
+            effective_head_size = bytes_per_page_padded // sub_page_size
+            layer_groups.append(LayerGroupSpec(
+                num_layers=len(gi["layer_ids"]),
+                num_kv_heads=1,
+                head_size=effective_head_size,
+                layer_indices=list(gi["layer_ids"]),
+                compress_ratio=gi["ratio"],
+                dtype=gi["dtype"],
+            ))
+        return layer_groups
+
+    def _build_mla_indexer_layer_group_specs(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: List[torch.Tensor],
+    ) -> List[LayerGroupSpec]:
+        """Main MLA KV + sparse-attention indexer as two layer groups."""
+        _, num_kv_heads, head_size = kv_caches[0].shape
+        main_layer_group = LayerGroupSpec(
+            num_layers=self.rank_info.num_layers_per_pp_stage,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
+            compress_ratio=1,
+            dtype=kv_caches[0].dtype,
+        )
+        indexer_tensor = indexer_buffers[0]
+        indexer_layer_group = LayerGroupSpec(
+            num_layers=len(indexer_buffers),
+            num_kv_heads=1,
+            head_size=indexer_tensor.shape[1],
+            layer_indices=list(range(len(indexer_buffers))),
+            compress_ratio=1,
+            dtype=indexer_buffers[0].dtype,
+        )
+        return [main_layer_group, indexer_layer_group]
+
+    def _apply_layer_groups_for_cache_sizing(
+        self,
+        kv_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]],
+    ) -> None:
+        """Set layer_groups and recompute num_cpu/ssd_blocks before KVManager."""
+        model_config = self.flexkv_config.model_config
+        cache_config = self.flexkv_config.cache_config
+
+        old_cpu = cache_config.num_cpu_blocks
+
+        if model_config.layer_groups is None:
+            if self._is_dsv4:
+                model_config.layer_groups = self._build_dsv4_layer_group_specs()
+            elif indexer_buffers is not None and len(indexer_buffers) > 0:
+                model_config.layer_groups = self._build_mla_indexer_layer_group_specs(
+                    kv_caches, indexer_buffers)
+            else:
+                return
+
+        if not recompute_cache_block_counts(model_config, cache_config):
+            return
+
+        logger.info(
+            f"[FlexKV] Cache block counts aligned to layer_groups{self._rank_label}: "
+            f"num_cpu_blocks {old_cpu} -> {cache_config.num_cpu_blocks}, "
+            f"num_groups={len(model_config.layer_groups)}"
+        )
+
+        for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
+            _orig = getattr(cache_config, _attr)
+            if _orig is None or _orig <= 0:
+                continue
+            _aligned = self._sync_ctx.all_reduce_min(_orig)
+            if _aligned != _orig:
+                logger.info(
+                    f"[FlexKV] Block count MIN alignment '{_attr}' after "
+                    f"layer_groups recompute{self._rank_label}: "
+                    f"{_orig} -> {_aligned}"
+                )
+            setattr(cache_config, _attr, _aligned)
 
     def _register_with_retry(
         self,
