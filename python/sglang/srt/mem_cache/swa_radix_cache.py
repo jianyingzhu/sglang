@@ -383,13 +383,108 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def _swa_slots_in_value(self, value: torch.Tensor) -> int:
         """SWA-pool slots referenced by full-layer indices in *value*.
 
-        ``alloc_extend_swa_tail`` (FlexKV load-back) only maps the trailing
-        window; using ``len(value)`` over-counts eviction and metrics.
+        Every non-tombstone node is *homogeneously* SWA-mapped: normal prefill
+        maps the whole node, and FlexKV load-back (``alloc_extend_swa_tail``)
+        splits its tail-only mapping at the SWA boundary in ``_insert_helper``
+        so the unmapped head becomes a separate ``swa_tombstone`` node. Hence
+        the SWA slot count is simply ``len(value)``. Reading the live
+        full-to-SWA mapping here would be unsafe: ``dec_swa_lock_only`` zeroes
+        it mid-lock, making ``inc_lock_ref``/``dec_lock_ref`` disagree.
+
+        Tombstone nodes never reach here (their SWA was already freed and the
+        callers take an explicit 0 / skip branch for them).
+        """
+        return len(value)
+
+    def _assert_swa_homogeneous(self, node: TreeNode, where: str) -> None:
+        """One-shot diagnostic: a non-tombstone node MUST be homogeneously
+        SWA-mapped, i.e. every full slot in ``node.value`` has a live
+        full->swa mapping. ``_swa_slots_in_value`` returns ``len(value)`` on
+        that assumption; if it breaks, the ``len``-based add / ``free_swa``-based
+        subtract become asymmetric and ``swa_evictable_size_`` leaks.
+
+        Enabled only for the hybrid-SWA paged allocator (the FlexKV load-back
+        path that introduced tail-only mapping). Cheap to leave on while
+        chasing the leak; remove once root-caused.
+        """
+        if node.swa_tombstone:
+            return
+        allocator = self.token_to_kv_pool_allocator
+        if not hasattr(allocator, "count_mapped_swa_slots"):
+            return
+        mapped = allocator.count_mapped_swa_slots(node.value)
+        assert mapped == len(node.value), (
+            f"[swa-homogeneity] non-tombstone node has {mapped} mapped SWA "
+            f"slots but len(value)={len(node.value)} at {where}; "
+            f"{node.id=}, {node.swa_lock_ref=}, {node.full_lock_ref=}"
+        )
+
+    def _mapped_swa_tail_len(self, value: torch.Tensor) -> int:
+        """Length of the contiguous SWA-mapped *suffix* of ``value``.
+
+        ``alloc_extend_swa_tail`` maps only a trailing window and ``free_swa``
+        zeroes contiguous regions, so the live full->swa mapping of any value is
+        always a suffix: ``[0, gap)`` unmapped, ``[gap, end)`` mapped. We read it
+        exactly ONCE here, at insert/revive time, to decide where to split the
+        tombstone head from the active tail. After the split every non-tombstone
+        node is homogeneous, so all later accounting uses the stable
+        ``len(value)`` (see ``_swa_slots_in_value``) and never re-reads the
+        mutating mapping.
+
+        Non-hybrid allocators (no SWA pool) are always fully mapped -> ``len``.
         """
         allocator = self.token_to_kv_pool_allocator
-        if hasattr(allocator, "count_mapped_swa_slots"):
-            return allocator.count_mapped_swa_slots(value)
-        return len(value)
+        mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+        if mapping is None or len(value) == 0:
+            return len(value)
+        mapped = mapping[value] > 0  # bool tensor, True where SWA-mapped
+        total = int(mapped.sum().item())
+        if total == 0 or total == len(value):
+            return total  # fully unmapped / fully mapped fast path
+        # Mapped region must be a contiguous suffix; count trailing True.
+        rev = mapped.flip(0)
+        first_unmapped = (~rev).nonzero()
+        tail = (
+            int(first_unmapped[0].item())
+            if first_unmapped.numel()
+            else len(value)
+        )
+        assert tail == total, (
+            f"[swa] non-suffix SWA mapping in revive: {tail=} {total=} "
+            f"{len(value)=}"
+        )
+        return tail
+
+    def _revive_tombstone_tail(
+        self, node: TreeNode, new_value: torch.Tensor
+    ) -> None:
+        """Revive only the SWA-mapped suffix of a tombstone ``node``.
+
+        Caller has already freed the node's stale full slots; ``new_value`` is
+        the fresh full KV for this region. We activate (un-tombstone) only the
+        contiguous SWA-mapped tail and keep the unmapped head as a
+        ``swa_tombstone`` node, so every non-tombstone node stays homogeneous
+        and the ``len``-based / ``free_swa``-based accounting cannot diverge.
+        """
+        node.value = new_value.clone()
+        mapped_tail = self._mapped_swa_tail_len(node.value)
+
+        if mapped_tail == 0:
+            # Nothing mapped: refreshed full KV only, stay tombstone, no SWA
+            # accounting touched.
+            return
+
+        if mapped_tail < len(node.value):
+            # Split at the (page-aligned) mapping boundary: _split_node makes the
+            # unmapped prefix a new head node (inherits swa_tombstone=True) and
+            # keeps `node` as the mapped suffix.
+            split_at = len(node.value) - mapped_tail
+            self._split_node(node.key, node, split_at)
+
+        node.swa_tombstone = False
+        self.swa_lru_list.insert_mru(node)
+        # node.value is now the homogeneous mapped tail, so len == mapped_tail.
+        self.swa_evictable_size_ += len(node.value)
 
     def reset(self) -> None:
         self.root_node = TreeNode()
@@ -529,11 +624,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        #
+        # Pass swa_evicted_seqlen so _insert_helper splits this prefix at the
+        # SWA eviction frontier: `maybe_evict_swa`/`_evict_swa` already called
+        # `free_swa` on req_to_token[*, :swa_evicted_seqlen] for tokens that
+        # slid out of the window, zeroing their full->swa mapping. Without this
+        # boundary the head [old_prefix_len, swa_evicted_seqlen) would be
+        # inserted as a NON-tombstone node whose SWA mapping is already gone,
+        # making it heterogeneous (len(value) != mapped slots) and breaking the
+        # `_swa_slots_in_value == len(value)` accounting invariant. This mirrors
+        # `cache_finished_req`, which already passes swa_evicted_seqlen.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
@@ -643,6 +749,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
                     swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
+                    # Diagnostic: a non-tombstone node is assumed homogeneous,
+                    # so free_swa must reclaim exactly len(value) slots. If it
+                    # frees fewer, the `+= len(value)` adds elsewhere never get
+                    # matched here and swa_evictable_size_ leaks upward.
+                    assert swa_freed == len(x.value), (
+                        f"[swa-homogeneity] evict internal node freed {swa_freed} "
+                        f"SWA slots but len(value)={len(x.value)}; {x.id=}"
+                    )
                     swa_num_evicted += swa_freed
 
                     # 2. get the next node, update the lru lists
@@ -721,6 +835,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert (
                     not node.swa_tombstone
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
+                self._assert_swa_homogeneous(node, "inc_lock_ref")
                 swa_slots = self._swa_slots_in_value(node.value)
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= swa_slots
@@ -771,6 +886,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert (
                     node.swa_lock_ref > 0
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
+                self._assert_swa_homogeneous(node, "dec_lock_ref")
 
                 if node.swa_lock_ref == 1:
                     swa_slots = self._swa_slots_in_value(node.value)
@@ -843,6 +959,152 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def sanity_check(self, exempt_node_ids: Optional[Set[int]] = None):
         self.full_lru_list.sanity_check(self, exempt_node_ids)
         self.swa_lru_list.sanity_check(self, exempt_node_ids)
+
+    def audit_evictable(self) -> str:
+        """Diagnostic: walk the whole tree and reconcile the live evictable
+        counters against what the nodes actually hold, and against the
+        allocator's free state. Distinguishes the two leak classes:
+
+          * counter drift: sum(node values over evictable nodes) != counter
+            -> some add/sub path is wrong; the slots are still tree-owned.
+          * double ownership: a tree node's slots are ALSO free in the
+            allocator -> the slots were freed out from under the tree.
+
+        Returns a human-readable report; call it from the leak path.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        full_sum = 0
+        swa_sum = 0
+        full_locked = 0
+        swa_locked = 0
+        n_nodes = 0
+        n_tombstone = 0
+        # Reconcile counters by walking every node.
+        stack = [self.root_node]
+        offending = []
+        free_index = None
+        # Build a set of free full-pool slots if the allocator exposes one.
+        try:
+            base = getattr(allocator, "full_attn_allocator", allocator)
+            fs = getattr(base, "free_slots", None)
+            if fs is not None:
+                free_index = set(int(x) for x in fs.tolist())
+        except Exception:
+            free_index = None
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is self.root_node:
+                continue
+            n_nodes += 1
+            vlen = len(node.value)
+            if node.full_lock_ref > 0:
+                full_locked += vlen
+            else:
+                full_sum += vlen
+            if node.swa_tombstone:
+                n_tombstone += 1
+            else:
+                swa_slots = self._swa_slots_in_value(node.value)
+                if node.swa_lock_ref > 0:
+                    swa_locked += swa_slots
+                else:
+                    swa_sum += swa_slots
+            # Double-ownership check: are any of this node's slots free?
+            if free_index is not None:
+                try:
+                    vals = node.value.tolist()
+                    dbl = [v for v in vals if int(v) in free_index]
+                    if dbl:
+                        offending.append(
+                            f"node {node.id} (len={vlen}, tomb={node.swa_tombstone}, "
+                            f"flock={node.full_lock_ref}, slock={node.swa_lock_ref}): "
+                            f"{len(dbl)} slots also FREE in allocator e.g. {dbl[:4]}"
+                        )
+                except Exception:
+                    pass
+        report = (
+            f"[audit] nodes={n_nodes} tombstone={n_tombstone} | "
+            f"full_evictable counter={self.full_evictable_size_} "
+            f"walked={full_sum} (locked={full_locked}) | "
+            f"swa_evictable counter={self.swa_evictable_size_} "
+            f"walked={swa_sum} (locked={swa_locked})"
+        )
+        if offending:
+            report += "\n[audit] DOUBLE-OWNED slots:\n  " + "\n  ".join(offending)
+        else:
+            report += "\n[audit] no double-owned (tree-vs-freelist) slots"
+
+        # (1) tree-vs-tree: is any physical full slot referenced by >1 node?
+        # That inflates `walked`/counter symmetrically while the slot stays
+        # allocated -> available+evictable exceeds total with no free overlap.
+        slot_owner = {}
+        dup_pairs = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is self.root_node:
+                continue
+            try:
+                for v in node.value.tolist():
+                    v = int(v)
+                    if v in slot_owner:
+                        dup_pairs.append((v, slot_owner[v], node.id))
+                    else:
+                        slot_owner[v] = node.id
+            except Exception:
+                pass
+        if dup_pairs:
+            sample = dup_pairs[:6]
+            report += (
+                f"\n[audit] TREE-INTERNAL duplicate full slots: {len(dup_pairs)} "
+                f"e.g. {[(s, a, b) for s, a, b in sample]} "
+                f"(slot, owner_node_a, owner_node_b)"
+            )
+            # Dump every node so we can see the structural relationship between
+            # the duplicate owners (parent/child, key range, tombstone, locks).
+            stack = [self.root_node]
+            lines = []
+            while stack:
+                nd = stack.pop()
+                stack.extend(nd.children.values())
+                try:
+                    vals = nd.value.tolist() if nd is not self.root_node else []
+                except Exception:
+                    vals = []
+                head = vals[0] if vals else None
+                tailv = vals[-1] if vals else None
+                lines.append(
+                    f"  id={nd.id} parent={getattr(nd.parent, 'id', None)} "
+                    f"klen={len(nd.key) if nd.key is not None else 0} "
+                    f"vlen={len(vals)} tomb={nd.swa_tombstone} "
+                    f"flock={nd.full_lock_ref} slock={nd.swa_lock_ref} "
+                    f"nchild={len(nd.children)} vrange=[{head}..{tailv}]"
+                )
+            report += "\n[audit] tree dump:\n" + "\n".join(lines)
+        else:
+            report += "\n[audit] no tree-internal duplicate full slots"
+
+        # (2) free-list duplicates: a double-free shows up as the same id
+        # appearing twice in free_slots, inflating available_size().
+        try:
+            base = getattr(allocator, "full_attn_allocator", allocator)
+            fs = getattr(base, "free_slots", None)
+            if fs is not None:
+                lst = [int(x) for x in fs.tolist()]
+                n_dup = len(lst) - len(set(lst))
+                report += f"\n[audit] full free_slots: len={len(lst)} dups={n_dup}"
+            swa_base = getattr(allocator, "swa_attn_allocator", None)
+            sfs = getattr(swa_base, "free_slots", None) if swa_base else None
+            if sfs is not None:
+                slst = [int(x) for x in sfs.tolist()]
+                sdup = len(slst) - len(set(slst))
+                report += f"\n[audit] swa free_slots: len={len(slst)} dups={sdup}"
+        except Exception as e:
+            report += f"\n[audit] free_slots dup check failed: {e}"
+
+        return report
 
     def evictable_size(self) -> int:
         # Legacy single-pool callers use full-attention evictable only.
@@ -1165,31 +1427,28 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
                     if swa_evicted_seqlen <= total_prefix_length:
-                        # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
-                        # Free full tokens in the original tree node.
+                        # Branch 1: caller believes the whole region is past the
+                        # eviction boundary. Under tail-only FlexKV mapping that
+                        # belief can be wrong (the value may have only a mapped
+                        # suffix), so revive by ACTUAL mapped tail, not by len.
+                        # Free the node's stale full slots first.
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
-                        # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len].clone()
-                        node.swa_tombstone = False
-                        self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += self._swa_slots_in_value(
-                            node.value
-                        )
+                        self._revive_tombstone_tail(node, value[:prefix_len])
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
-                        # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
+                        # Branch 2: caller-known boundary lands inside this
+                        # region. Free the head's stale full, split at the
+                        # boundary, then revive the tail by its actual mapping
+                        # (a second split if the mapped suffix is shorter still).
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
                         self._split_node(node.key, node, start_update_idx)
-                        # Here node is the new node after split, so we can overwrite the value to the new node.
-                        # The old node is still swa tombstone and the full token is not freed.
-                        node.value = value[start_update_idx:prefix_len].clone()
+                        # The old (head) node stays swa tombstone; `node` is now
+                        # the suffix to revive.
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
-                        node.swa_tombstone = False
-                        self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += self._swa_slots_in_value(
-                            node.value
+                        self._revive_tombstone_tail(
+                            node, value[start_update_idx:prefix_len]
                         )
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
