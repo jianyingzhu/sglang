@@ -383,13 +383,85 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def _swa_slots_in_value(self, value: torch.Tensor) -> int:
         """SWA-pool slots referenced by full-layer indices in *value*.
 
-        ``alloc_extend_swa_tail`` (FlexKV load-back) only maps the trailing
-        window; using ``len(value)`` over-counts eviction and metrics.
+        Every non-tombstone node is *homogeneously* SWA-mapped: normal prefill
+        maps the whole node, and FlexKV load-back (``alloc_extend_swa_tail``)
+        splits its tail-only mapping at the SWA boundary in ``_insert_helper``
+        so the unmapped head becomes a separate ``swa_tombstone`` node. Hence
+        the SWA slot count is simply ``len(value)``. Reading the live
+        full-to-SWA mapping here would be unsafe: ``dec_swa_lock_only`` zeroes
+        it mid-lock, making ``inc_lock_ref``/``dec_lock_ref`` disagree.
+
+        Tombstone nodes never reach here (their SWA was already freed and the
+        callers take an explicit 0 / skip branch for them).
+        """
+        return len(value)
+
+    def _mapped_swa_tail_len(self, value: torch.Tensor) -> int:
+        """Length of the contiguous SWA-mapped *suffix* of ``value``.
+
+        ``alloc_extend_swa_tail`` maps only a trailing window and ``free_swa``
+        zeroes contiguous regions, so the live full->swa mapping of any value is
+        always a suffix: ``[0, gap)`` unmapped, ``[gap, end)`` mapped. We read it
+        exactly ONCE here, at insert/revive time, to decide where to split the
+        tombstone head from the active tail. After the split every non-tombstone
+        node is homogeneous, so all later accounting uses the stable
+        ``len(value)`` (see ``_swa_slots_in_value``) and never re-reads the
+        mutating mapping.
+
+        Non-hybrid allocators (no SWA pool) are always fully mapped -> ``len``.
         """
         allocator = self.token_to_kv_pool_allocator
-        if hasattr(allocator, "count_mapped_swa_slots"):
-            return allocator.count_mapped_swa_slots(value)
-        return len(value)
+        mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+        if mapping is None or len(value) == 0:
+            return len(value)
+        mapped = mapping[value] > 0  # bool tensor, True where SWA-mapped
+        total = int(mapped.sum().item())
+        if total == 0 or total == len(value):
+            return total  # fully unmapped / fully mapped fast path
+        # Mapped region must be a contiguous suffix; count trailing True.
+        rev = mapped.flip(0)
+        first_unmapped = (~rev).nonzero()
+        tail = (
+            int(first_unmapped[0].item())
+            if first_unmapped.numel()
+            else len(value)
+        )
+        assert tail == total, (
+            f"[swa] non-suffix SWA mapping in revive: {tail=} {total=} "
+            f"{len(value)=}"
+        )
+        return tail
+
+    def _revive_tombstone_tail(
+        self, node: TreeNode, new_value: torch.Tensor
+    ) -> None:
+        """Revive only the SWA-mapped suffix of a tombstone ``node``.
+
+        Caller has already freed the node's stale full slots; ``new_value`` is
+        the fresh full KV for this region. We activate (un-tombstone) only the
+        contiguous SWA-mapped tail and keep the unmapped head as a
+        ``swa_tombstone`` node, so every non-tombstone node stays homogeneous
+        and the ``len``-based / ``free_swa``-based accounting cannot diverge.
+        """
+        node.value = new_value.clone()
+        mapped_tail = self._mapped_swa_tail_len(node.value)
+
+        if mapped_tail == 0:
+            # Nothing mapped: refreshed full KV only, stay tombstone, no SWA
+            # accounting touched.
+            return
+
+        if mapped_tail < len(node.value):
+            # Split at the (page-aligned) mapping boundary: _split_node makes the
+            # unmapped prefix a new head node (inherits swa_tombstone=True) and
+            # keeps `node` as the mapped suffix.
+            split_at = len(node.value) - mapped_tail
+            self._split_node(node.key, node, split_at)
+
+        node.swa_tombstone = False
+        self.swa_lru_list.insert_mru(node)
+        # node.value is now the homogeneous mapped tail, so len == mapped_tail.
+        self.swa_evictable_size_ += len(node.value)
 
     def reset(self) -> None:
         self.root_node = TreeNode()
@@ -529,11 +601,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        #
+        # Pass swa_evicted_seqlen so _insert_helper splits this prefix at the
+        # SWA eviction frontier: `maybe_evict_swa`/`_evict_swa` already called
+        # `free_swa` on req_to_token[*, :swa_evicted_seqlen] for tokens that
+        # slid out of the window, zeroing their full->swa mapping. Without this
+        # boundary the head [old_prefix_len, swa_evicted_seqlen) would be
+        # inserted as a NON-tombstone node whose SWA mapping is already gone,
+        # making it heterogeneous (len(value) != mapped slots) and breaking the
+        # `_swa_slots_in_value == len(value)` accounting invariant. This mirrors
+        # `cache_finished_req`, which already passes swa_evicted_seqlen.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
@@ -1165,31 +1248,28 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
                     if swa_evicted_seqlen <= total_prefix_length:
-                        # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
-                        # Free full tokens in the original tree node.
+                        # Branch 1: caller believes the whole region is past the
+                        # eviction boundary. Under tail-only FlexKV mapping that
+                        # belief can be wrong (the value may have only a mapped
+                        # suffix), so revive by ACTUAL mapped tail, not by len.
+                        # Free the node's stale full slots first.
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
-                        # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len].clone()
-                        node.swa_tombstone = False
-                        self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += self._swa_slots_in_value(
-                            node.value
-                        )
+                        self._revive_tombstone_tail(node, value[:prefix_len])
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
-                        # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
+                        # Branch 2: caller-known boundary lands inside this
+                        # region. Free the head's stale full, split at the
+                        # boundary, then revive the tail by its actual mapping
+                        # (a second split if the mapped suffix is shorter still).
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
                         self._split_node(node.key, node, start_update_idx)
-                        # Here node is the new node after split, so we can overwrite the value to the new node.
-                        # The old node is still swa tombstone and the full token is not freed.
-                        node.value = value[start_update_idx:prefix_len].clone()
+                        # The old (head) node stays swa tombstone; `node` is now
+                        # the suffix to revive.
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
-                        node.swa_tombstone = False
-                        self.swa_lru_list.insert_mru(node)
-                        self.swa_evictable_size_ += self._swa_slots_in_value(
-                            node.value
+                        self._revive_tombstone_tail(
+                            node, value[start_update_idx:prefix_len]
                         )
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.

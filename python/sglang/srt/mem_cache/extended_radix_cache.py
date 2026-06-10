@@ -199,6 +199,22 @@ class ExtendedRadixCache(BasePrefixCache):
         # Detect hybrid-SWA paged allocator by the alloc_extend_swa_tail method.
         has_swa_tail = hasattr(allocator, "alloc_extend_swa_tail")
 
+        def _swa_tail_len() -> int:
+            # SWA slots to allocate/map for the trailing window. Use CEIL to a
+            # page so the mapped tail node is >= sliding_window_size tokens.
+            # _insert_helper splits the unmapped head into a `swa_tombstone`
+            # node; if the mapped tail were < window, inc_lock_ref would not
+            # finish locking the window inside the tail and would walk up into
+            # the tombstone head, hitting `assert not swa_tombstone`. Cap at
+            # host_hit_length (which is already page-aligned) and re-floor to a
+            # page as a defensive guard.
+            tail = min(
+                ((window_size + page_size - 1) // page_size) * page_size,
+                host_hit_length,
+            )
+            tail = (tail // page_size) * page_size
+            return tail if tail > 0 else page_size
+
         def _alloc_paged():
             # prefix_lens is the device-cached length so far. host_hit_length is
             # appended after that.
@@ -215,19 +231,10 @@ class ExtendedRadixCache(BasePrefixCache):
             else:
                 last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
             if has_swa_tail and window_size > 0:
-                # Hybrid SWA: only allocate `window` SWA slots regardless of how
-                # many full slots we need. Cap window at host_hit_length so the
-                # allocator's `0 <= swa_tail_len <= extend_num_tokens` assertion
-                # holds when the hit is shorter than the window.
-                swa_tail_len = min(window_size, host_hit_length)
-                # Round swa_tail_len down to a page multiple — alloc_extend_swa_tail
-                # converts it to ceil(num_swa_pages) which would over-allocate the
-                # SWA pool by up to a page on partial-page tails. Page-align here
-                # so the FlexKV-stored window matches exactly.
-                if swa_tail_len % page_size != 0:
-                    swa_tail_len = (swa_tail_len // page_size) * page_size
-                if swa_tail_len == 0:
-                    swa_tail_len = page_size  # at least one page
+                # Hybrid SWA: only allocate the trailing window of SWA slots
+                # regardless of how many full slots we need (see _swa_tail_len
+                # for the ceil-to-page rationale vs. inc_lock_ref).
+                swa_tail_len = _swa_tail_len()
                 return allocator.alloc_extend_swa_tail(
                     prefix_lens,
                     prefix_lens_cpu,
@@ -261,12 +268,7 @@ class ExtendedRadixCache(BasePrefixCache):
 
         swa_alloc_need = host_hit_length
         if has_swa_tail and window_size > 0 and page_size > 1:
-            swa_tail_len = min(window_size, host_hit_length)
-            if swa_tail_len % page_size != 0:
-                swa_tail_len = (swa_tail_len // page_size) * page_size
-            if swa_tail_len == 0:
-                swa_tail_len = page_size
-            swa_alloc_need = swa_tail_len
+            swa_alloc_need = _swa_tail_len()
 
         device_indices = _do_alloc()
         if device_indices is None:
@@ -325,10 +327,25 @@ class ExtendedRadixCache(BasePrefixCache):
             self._connector.release_load_state(req.rid)
             return empty_indices, req.last_node
 
+        # IMPORTANT: insert with the FULL key from sequence start, not a slice
+        # starting at gpu_cached_len. insert() always navigates from root_node;
+        # a relative slice would be treated as starting at position 0 and create
+        # a PARALLEL node hanging off root (or the wrong parent), duplicating the
+        # loaded slots. The subsequent cache_unfinished_req / cache_finished_req
+        # re-inserts the same prefix with the full key and lands the slots at the
+        # correct position, leaving two tree nodes that own the same physical KV
+        # slots -> tree-internal duplication -> pool leak. Mirror the re-match
+        # below (which already uses the full key) and pass the device-cached
+        # prefix slots as the head of `value` so insert can dedup against the
+        # existing prefix nodes. `prev_prefix_len=gpu_cached_len` makes
+        # _insert_helper skip (not free) that already-in-tree prefix region.
         key = RadixKey(
-            token_ids=req.fill_ids[gpu_cached_len : gpu_cached_len + host_hit_length],
+            token_ids=req.fill_ids[: gpu_cached_len + host_hit_length],
             extra_key=req.extra_key,
         )
+        # Full value = device-cached prefix slots (currently in req.prefix_indices,
+        # before the post-insert cat below) ++ freshly loaded tail slots.
+        full_value = torch.cat([req.prefix_indices.to(device_indices), device_indices])
 
         # Delegate node creation to the inner cache's insert() API. This is
         # important because:
@@ -342,17 +359,50 @@ class ExtendedRadixCache(BasePrefixCache):
         # After insert, we re-match the same key under root to find the new
         # leaf node we just created (or the merged leaf if the prefix already
         # existed). That node is what we lock and queue for H2D.
+        #
+        # Tail-only SWA mapping: alloc_extend_swa_tail mapped only the trailing
+        # `swa_tail_len` full slots to the SWA pool; the head is unmapped. Pass
+        # that boundary as `swa_evicted_seqlen` so _insert_helper splits the
+        # head into a `swa_tombstone` node (full KV kept, no SWA) and the tail
+        # into a normal node (homogeneously SWA-mapped). This keeps every node
+        # SWA-homogeneous so `_swa_slots_in_value == len(value)` holds and the
+        # inc/dec lock accounting stays consistent. Boundary is relative to the
+        # key start (total_prefix_length is 0 for this freshly inserted prefix).
+        # Skip for eagle: the bigram view shifts the key by 1 and would misalign
+        # the boundary; eagle+hybrid-SWA is not a supported combination.
+        # swa_evicted_seqlen is now ABSOLUTE from sequence start (key starts at 0):
+        # the loaded tail spans [gpu_cached_len, gpu_cached_len + effective_len);
+        # its head [.., gpu_cached_len + effective_len - swa_tail_len) is unmapped.
+        swa_evicted_seqlen = 0
+        if has_swa_tail and window_size > 0 and not is_eagle:
+            swa_evicted_seqlen = gpu_cached_len + max(
+                0, effective_len - _swa_tail_len()
+            )
         try:
             self._inner_radixtree.insert(
                 InsertParams(
                     key=key,
-                    value=device_indices,
+                    value=full_value,
                     prev_prefix_len=gpu_cached_len,
+                    swa_evicted_seqlen=swa_evicted_seqlen,
                 )
             )
         except TypeError:
             # Fallback for caches whose insert() takes positional args
-            self._inner_radixtree.insert(InsertParams(key=key, value=device_indices))
+            self._inner_radixtree.insert(InsertParams(key=key, value=full_value))
+
+        # Persist the SWA eviction frontier onto the req. The boundary computed
+        # above is an INTRINSIC property of this prefix: alloc_extend_swa_tail
+        # physically mapped only the trailing `swa_tail_len` slots, so the head
+        # has no SWA pool backing — permanently, not just for this one insert.
+        # `swa_evicted_seqlen` is already absolute from sequence start. Without
+        # persisting it, the NEXT cache_unfinished_req / cache_finished_req for
+        # the same req would re-insert the whole prefix with swa_evicted_seqlen=0,
+        # recreating a heterogeneous (head-unmapped) non-tombstone node and
+        # tripping the SWA-homogeneity invariant. Use max() so we never walk the
+        # frontier backwards past an _evict_swa update.
+        if swa_evicted_seqlen > 0:
+            req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, swa_evicted_seqlen)
 
         # Re-match the full prefix path so we get the actual leaf node.
         # Use a fresh key starting from root with the same token_ids that
