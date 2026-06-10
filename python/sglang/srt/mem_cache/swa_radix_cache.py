@@ -396,29 +396,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         return len(value)
 
-    def _assert_swa_homogeneous(self, node: TreeNode, where: str) -> None:
-        """One-shot diagnostic: a non-tombstone node MUST be homogeneously
-        SWA-mapped, i.e. every full slot in ``node.value`` has a live
-        full->swa mapping. ``_swa_slots_in_value`` returns ``len(value)`` on
-        that assumption; if it breaks, the ``len``-based add / ``free_swa``-based
-        subtract become asymmetric and ``swa_evictable_size_`` leaks.
-
-        Enabled only for the hybrid-SWA paged allocator (the FlexKV load-back
-        path that introduced tail-only mapping). Cheap to leave on while
-        chasing the leak; remove once root-caused.
-        """
-        if node.swa_tombstone:
-            return
-        allocator = self.token_to_kv_pool_allocator
-        if not hasattr(allocator, "count_mapped_swa_slots"):
-            return
-        mapped = allocator.count_mapped_swa_slots(node.value)
-        assert mapped == len(node.value), (
-            f"[swa-homogeneity] non-tombstone node has {mapped} mapped SWA "
-            f"slots but len(value)={len(node.value)} at {where}; "
-            f"{node.id=}, {node.swa_lock_ref=}, {node.full_lock_ref=}"
-        )
-
     def _mapped_swa_tail_len(self, value: torch.Tensor) -> int:
         """Length of the contiguous SWA-mapped *suffix* of ``value``.
 
@@ -749,14 +726,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
                     swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
-                    # Diagnostic: a non-tombstone node is assumed homogeneous,
-                    # so free_swa must reclaim exactly len(value) slots. If it
-                    # frees fewer, the `+= len(value)` adds elsewhere never get
-                    # matched here and swa_evictable_size_ leaks upward.
-                    assert swa_freed == len(x.value), (
-                        f"[swa-homogeneity] evict internal node freed {swa_freed} "
-                        f"SWA slots but len(value)={len(x.value)}; {x.id=}"
-                    )
                     swa_num_evicted += swa_freed
 
                     # 2. get the next node, update the lru lists
@@ -835,7 +804,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert (
                     not node.swa_tombstone
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
-                self._assert_swa_homogeneous(node, "inc_lock_ref")
                 swa_slots = self._swa_slots_in_value(node.value)
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= swa_slots
@@ -886,7 +854,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert (
                     node.swa_lock_ref > 0
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
-                self._assert_swa_homogeneous(node, "dec_lock_ref")
 
                 if node.swa_lock_ref == 1:
                     swa_slots = self._swa_slots_in_value(node.value)
@@ -959,152 +926,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def sanity_check(self, exempt_node_ids: Optional[Set[int]] = None):
         self.full_lru_list.sanity_check(self, exempt_node_ids)
         self.swa_lru_list.sanity_check(self, exempt_node_ids)
-
-    def audit_evictable(self) -> str:
-        """Diagnostic: walk the whole tree and reconcile the live evictable
-        counters against what the nodes actually hold, and against the
-        allocator's free state. Distinguishes the two leak classes:
-
-          * counter drift: sum(node values over evictable nodes) != counter
-            -> some add/sub path is wrong; the slots are still tree-owned.
-          * double ownership: a tree node's slots are ALSO free in the
-            allocator -> the slots were freed out from under the tree.
-
-        Returns a human-readable report; call it from the leak path.
-        """
-        allocator = self.token_to_kv_pool_allocator
-        full_sum = 0
-        swa_sum = 0
-        full_locked = 0
-        swa_locked = 0
-        n_nodes = 0
-        n_tombstone = 0
-        # Reconcile counters by walking every node.
-        stack = [self.root_node]
-        offending = []
-        free_index = None
-        # Build a set of free full-pool slots if the allocator exposes one.
-        try:
-            base = getattr(allocator, "full_attn_allocator", allocator)
-            fs = getattr(base, "free_slots", None)
-            if fs is not None:
-                free_index = set(int(x) for x in fs.tolist())
-        except Exception:
-            free_index = None
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
-            if node is self.root_node:
-                continue
-            n_nodes += 1
-            vlen = len(node.value)
-            if node.full_lock_ref > 0:
-                full_locked += vlen
-            else:
-                full_sum += vlen
-            if node.swa_tombstone:
-                n_tombstone += 1
-            else:
-                swa_slots = self._swa_slots_in_value(node.value)
-                if node.swa_lock_ref > 0:
-                    swa_locked += swa_slots
-                else:
-                    swa_sum += swa_slots
-            # Double-ownership check: are any of this node's slots free?
-            if free_index is not None:
-                try:
-                    vals = node.value.tolist()
-                    dbl = [v for v in vals if int(v) in free_index]
-                    if dbl:
-                        offending.append(
-                            f"node {node.id} (len={vlen}, tomb={node.swa_tombstone}, "
-                            f"flock={node.full_lock_ref}, slock={node.swa_lock_ref}): "
-                            f"{len(dbl)} slots also FREE in allocator e.g. {dbl[:4]}"
-                        )
-                except Exception:
-                    pass
-        report = (
-            f"[audit] nodes={n_nodes} tombstone={n_tombstone} | "
-            f"full_evictable counter={self.full_evictable_size_} "
-            f"walked={full_sum} (locked={full_locked}) | "
-            f"swa_evictable counter={self.swa_evictable_size_} "
-            f"walked={swa_sum} (locked={swa_locked})"
-        )
-        if offending:
-            report += "\n[audit] DOUBLE-OWNED slots:\n  " + "\n  ".join(offending)
-        else:
-            report += "\n[audit] no double-owned (tree-vs-freelist) slots"
-
-        # (1) tree-vs-tree: is any physical full slot referenced by >1 node?
-        # That inflates `walked`/counter symmetrically while the slot stays
-        # allocated -> available+evictable exceeds total with no free overlap.
-        slot_owner = {}
-        dup_pairs = []
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
-            if node is self.root_node:
-                continue
-            try:
-                for v in node.value.tolist():
-                    v = int(v)
-                    if v in slot_owner:
-                        dup_pairs.append((v, slot_owner[v], node.id))
-                    else:
-                        slot_owner[v] = node.id
-            except Exception:
-                pass
-        if dup_pairs:
-            sample = dup_pairs[:6]
-            report += (
-                f"\n[audit] TREE-INTERNAL duplicate full slots: {len(dup_pairs)} "
-                f"e.g. {[(s, a, b) for s, a, b in sample]} "
-                f"(slot, owner_node_a, owner_node_b)"
-            )
-            # Dump every node so we can see the structural relationship between
-            # the duplicate owners (parent/child, key range, tombstone, locks).
-            stack = [self.root_node]
-            lines = []
-            while stack:
-                nd = stack.pop()
-                stack.extend(nd.children.values())
-                try:
-                    vals = nd.value.tolist() if nd is not self.root_node else []
-                except Exception:
-                    vals = []
-                head = vals[0] if vals else None
-                tailv = vals[-1] if vals else None
-                lines.append(
-                    f"  id={nd.id} parent={getattr(nd.parent, 'id', None)} "
-                    f"klen={len(nd.key) if nd.key is not None else 0} "
-                    f"vlen={len(vals)} tomb={nd.swa_tombstone} "
-                    f"flock={nd.full_lock_ref} slock={nd.swa_lock_ref} "
-                    f"nchild={len(nd.children)} vrange=[{head}..{tailv}]"
-                )
-            report += "\n[audit] tree dump:\n" + "\n".join(lines)
-        else:
-            report += "\n[audit] no tree-internal duplicate full slots"
-
-        # (2) free-list duplicates: a double-free shows up as the same id
-        # appearing twice in free_slots, inflating available_size().
-        try:
-            base = getattr(allocator, "full_attn_allocator", allocator)
-            fs = getattr(base, "free_slots", None)
-            if fs is not None:
-                lst = [int(x) for x in fs.tolist()]
-                n_dup = len(lst) - len(set(lst))
-                report += f"\n[audit] full free_slots: len={len(lst)} dups={n_dup}"
-            swa_base = getattr(allocator, "swa_attn_allocator", None)
-            sfs = getattr(swa_base, "free_slots", None) if swa_base else None
-            if sfs is not None:
-                slst = [int(x) for x in sfs.tolist()]
-                sdup = len(slst) - len(set(slst))
-                report += f"\n[audit] swa free_slots: len={len(slst)} dups={sdup}"
-        except Exception as e:
-            report += f"\n[audit] free_slots dup check failed: {e}"
-
-        return report
 
     def evictable_size(self) -> int:
         # Legacy single-pool callers use full-attention evictable only.

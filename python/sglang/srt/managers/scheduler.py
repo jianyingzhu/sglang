@@ -3172,17 +3172,6 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats(),
             )
             if has_leak:
-                # FlexKV+SWA leak diagnosis: dump the tree reconciliation so we
-                # can tell counter-drift from double-owned slots before raising.
-                audit = getattr(self.tree_cache, "audit_evictable", None)
-                if audit is None:
-                    inner = getattr(self.tree_cache, "_inner_radixtree", None)
-                    audit = getattr(inner, "audit_evictable", None)
-                if audit is not None:
-                    try:
-                        logger.error("pool leak audit:\n%s", audit())
-                    except Exception as e:
-                        logger.error("pool leak audit failed: %s", e)
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 
