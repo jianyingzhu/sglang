@@ -4,7 +4,7 @@ import os
 import socket
 import struct
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -574,6 +574,18 @@ class FlexKVConnector(BaseKVConnector):
                     try:
                         matched_prefix = token_ids_np[:hit_length]
                         swa_avail = self.kv_manager.swa_available(matched_prefix)
+                        # [FLEXKV-DEBUG-ISOLATE] Run B: force SWA unavailable so the
+                        # backward-search below shrinks hit_length to exclude the SWA
+                        # trailing window. The excluded tail is recomputed (correct),
+                        # leaving only the c4/c128 main H2D path under test. This keeps
+                        # the hit_length / loadback chain consistent (no stale GPU
+                        # slots), unlike skipping SWA restore at load time.
+                        if os.getenv("FLEXKV_DEBUG_FORCE_SWA_UNAVAILABLE", "0") == "1":
+                            logger.info(
+                                f"[FLEXKV-DEBUG] Forcing swa_available=False "
+                                f"(was {swa_avail}) for isolation, hit_length={hit_length}"
+                            )
+                            swa_avail = False
                         # INFO-level so we can see at runtime whether SWA path is even taken
                         logger.info(
                             f"[FlexKV-SWA] match: hit_length={hit_length}, "
@@ -682,7 +694,15 @@ class FlexKVConnector(BaseKVConnector):
             # slots before launching full-layer H2D.
             had_pending_swa_restore = op.rid in self._pending_swa_token_ids
             if had_pending_swa_restore:
+                logger.info(
+                    f"[FLEXKV-DEBUG] SWA restore path TAKEN rid={op.rid}, "
+                    f"device_indices_count={int(op.device_indices.numel())}"
+                )
                 self._do_swa_restore_for_op(op)
+            else:
+                logger.info(
+                    f"[FLEXKV-DEBUG] SWA restore path NOT taken (no pending) rid={op.rid}"
+                )
             flexkv_task_ids.append(fkv_tid)
             indices = op.device_indices
             slot_mapping_cpu = indices.cpu() if indices.is_cuda else indices
@@ -747,6 +767,12 @@ class FlexKVConnector(BaseKVConnector):
                 )
 
             if self._sync_ctx.is_sync_leader:
+                # [FLEXKV-DEBUG-ISOLATE] main c4/c128/indexer H2D path.
+                logger.info(
+                    f"[FLEXKV-DEBUG] MAIN H2D (layerwise) launch task_ids={flexkv_task_ids}, "
+                    f"slot_counts={[int(s.numel()) for s in slot_mappings]}, "
+                    f"counter_id={producer_id}"
+                )
                 self.kv_manager.launch(
                     task_ids=flexkv_task_ids,
                     slot_mappings=slot_mappings,
@@ -1175,7 +1201,16 @@ class FlexKVConnector(BaseKVConnector):
             return
 
         # DSv4 fallback: kv_buffer is List[Tensor[num_pages, bytes_per_page_padded]] uint8.
-        # swa_cpu_data layout (matching _extract path) is [num_layers, window, bpt] flattened.
+        # swa_cpu_data layout (matching _extract path) is [num_layers, window, bpt]
+        # flattened, in canonical host AoS order (nope+rope then scale per token).
+        # The GPU page uses a SoA (segmented) layout, so _dsv4_swa_page_cols()
+        # maps host AoS -> GPU SoA. We write via direct (row, col) advanced
+        # indexing rather than gather-row / scatter / write-row: in DSv4 the
+        # trailing-window tokens share a single page (page_ids all equal), so
+        # `layer_buf[page_ids] = rows` would be a duplicate-index assignment and
+        # only the last token's row would survive (last-wins), dropping every
+        # other token. (row, col) pairs are unique across tokens within a page,
+        # so the direct assignment below is correct.
         kv_buffer = getattr(self._swa_kv_pool, 'kv_buffer', None)
         if kv_buffer is not None and len(kv_buffer) > 0 and kv_buffer[0].dtype == torch.uint8:
             page_size = int(getattr(self._swa_kv_pool, 'page_size', 1) or 1)
@@ -1193,20 +1228,18 @@ class FlexKVConnector(BaseKVConnector):
             data_gpu = swa_cpu_data.to(device=self._device, non_blocking=True).view(
                 num_layers, window, bpt
             )
-            swa_indices_long = swa_indices.to(torch.long)
-            page_ids = swa_indices_long // page_size
-            page_offsets = (swa_indices_long % page_size) * bpt
-            byte_idx = torch.arange(bpt, device=self._device).unsqueeze(0)  # [1, bpt]
-            col_idx = page_offsets.unsqueeze(1) + byte_idx                  # [window, bpt]
+            swa_indices_long = swa_indices.to(torch.long).to(kv_buffer[0].device)
+            # SoA (row, col) indices into a page; symmetric with _extract.
+            row_idx, col_idx = self._dsv4_swa_page_cols(
+                swa_indices_long, page_size, bpt
+            )                                                  # both [window, bpt]
             for layer_id in range(num_layers):
-                layer_buf = kv_buffer[layer_id]                              # [num_pages, bytes_per_page_padded]
-                # Scatter [window, bpt] back into the right rows/cols
-                rows = layer_buf[page_ids]                                   # gather first
-                rows.scatter_(1, col_idx, data_gpu[layer_id])
-                layer_buf[page_ids] = rows
+                layer_buf = kv_buffer[layer_id]                # [num_pages, bytes_per_page_padded]
+                # Direct scatter: (row, col) pairs are unique per token byte.
+                layer_buf[row_idx, col_idx] = data_gpu[layer_id]
             torch.cuda.synchronize()
             logger.info(
-                f"[FlexKV-SWA] _restore via kv_buffer fallback: window={window}, "
+                f"[FlexKV-SWA] _restore via kv_buffer fallback (SoA): window={window}, "
                 f"layers={num_layers}, bpt={bpt}"
             )
             return
@@ -1267,6 +1300,69 @@ class FlexKVConnector(BaseKVConnector):
 
         torch.cuda.synchronize()
 
+    def _dsv4_swa_page_cols(
+        self, swa_indices_long: torch.Tensor, page_size: int, bpt: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute (row_idx, col_idx) into a DSv4 SWA kv_buffer layer for a set
+        of SWA token slots.
+
+        DSv4 stores each page in a **SoA (segmented) layout**, NOT a per-token
+        contiguous AoS layout (see
+        layers/attention/dsv4/index_buf_accessor.py::_set_k_and_s_triton_kernel):
+
+            page bytes = [ nope+rope segment | scale segment ]
+              - nope+rope: token t at byte offset  t * NOPE_ROPE_BYTES,
+                           length NOPE_ROPE_BYTES (= qk_nope fp8 + qk_rope bf16)
+              - scale:     starts at page_size * NOPE_ROPE_BYTES,
+                           token t at + t * PADDED_SCALE_BYTES
+
+        The host-side FlexKV slot uses a canonical per-token AoS layout of `bpt`
+        bytes: [0:NOPE_ROPE_BYTES) = nope+rope, [NOPE_ROPE_BYTES:bpt) = scale
+        (incl. pad). This helper returns index tensors that map that canonical
+        host layout to/from the GPU SoA page so extract and restore stay
+        byte-exactly symmetric.
+
+        Returns:
+            row_idx: [N, bpt] page-row index for advanced indexing.
+            col_idx: [N, bpt] in-page byte-column index, ordered to match the
+                     host AoS token layout (nope+rope bytes first, scale last).
+        """
+        pool = self._swa_kv_pool
+        dev = swa_indices_long.device
+
+        # Derive the SoA segment geometry from the pool (fall back to DSv4
+        # constants if an attribute is missing).
+        qk_nope = int(getattr(pool, "qk_nope_head_dim", 448))
+        qk_rope = int(getattr(pool, "qk_rope_head_dim", 64))
+        rope_itemsize = getattr(pool, "rope_storage_dtype", torch.bfloat16).itemsize
+        quant_block = int(getattr(pool, "quantize_block_size", 64))
+        scale_pad = int(getattr(pool, "scale_pad", 1))
+
+        nope_rope_bytes = qk_nope + qk_rope * rope_itemsize      # 448 + 64*2 = 576
+        scale_bytes = qk_nope // quant_block                     # 448 // 64  = 7
+        padded_scale_bytes = scale_bytes + scale_pad             # 7 + 1      = 8
+        s_offset = page_size * nope_rope_bytes                   # start of scale segment
+
+        # Sanity: canonical host token stride must equal nope+rope + padded scale.
+        assert nope_rope_bytes + padded_scale_bytes == bpt, (
+            f"DSv4 SWA layout mismatch: nope_rope({nope_rope_bytes}) + "
+            f"padded_scale({padded_scale_bytes}) != bpt({bpt})"
+        )
+
+        tok = (swa_indices_long % page_size).unsqueeze(1)        # [N, 1]
+        page_ids = (swa_indices_long // page_size).unsqueeze(1)  # [N, 1]
+
+        nr_cols = tok * nope_rope_bytes + torch.arange(
+            nope_rope_bytes, device=dev
+        ).unsqueeze(0)                                           # [N, 576]
+        sc_cols = s_offset + tok * padded_scale_bytes + torch.arange(
+            padded_scale_bytes, device=dev
+        ).unsqueeze(0)                                           # [N, 8]
+
+        col_idx = torch.cat([nr_cols, sc_cols], dim=1)          # [N, bpt]
+        row_idx = page_ids.expand(-1, bpt)                      # [N, bpt]
+        return row_idx, col_idx
+
     def _extract_swa_from_gpu(self, kv_indices: torch.Tensor) -> Optional["torch.Tensor"]:
         """Extract SWA data from SGLang's GPU SWA pool for the last window_size tokens.
 
@@ -1308,7 +1404,11 @@ class FlexKVConnector(BaseKVConnector):
                 return swa_data.cpu()
 
             # Path 2: DSv4 layout — kv_buffer is List[Tensor[num_pages, bytes_per_page_padded]] uint8.
-            # Each token occupies a contiguous bytes_per_token slice within a page row.
+            # Each page stores tokens in a SoA (segmented) layout: a contiguous
+            # nope+rope segment followed by a contiguous scale segment (NOT a
+            # per-token contiguous AoS slice). _dsv4_swa_page_cols() builds the
+            # (row, col) indices that map GPU SoA <-> canonical host AoS so that
+            # extract and restore are byte-exactly symmetric.
             kv_buffer = getattr(self._swa_kv_pool, 'kv_buffer', None)
             if kv_buffer is not None and len(kv_buffer) > 0 and kv_buffer[0].dtype == torch.uint8:
                 # Translate full -> SWA token indices (DSv4 SWA pool)
@@ -1323,25 +1423,22 @@ class FlexKVConnector(BaseKVConnector):
                 bpt = int(getattr(self._swa_kv_pool, 'kv_cache_total_dim', 0) or
                           self._swa_kv_pool.get_bytes_per_token())
 
-                # Compute per-token (page_id, byte_offset_within_page) on GPU
-                swa_indices_long = swa_indices.to(torch.long)
-                page_ids = swa_indices_long // page_size
-                page_offsets = (swa_indices_long % page_size) * bpt
+                swa_indices_long = swa_indices.to(torch.long).to(kv_buffer[0].device)
+                # SoA (row, col) indices into a page; col is ordered to match the
+                # canonical host AoS token layout (nope+rope first, scale last).
+                row_idx, col_idx = self._dsv4_swa_page_cols(
+                    swa_indices_long, page_size, bpt
+                )                                              # both [window, bpt]
 
                 num_layers = len(kv_buffer)
                 # Allocate output [num_layers, window, bpt] uint8 on GPU first, then move to CPU once
                 out_gpu = torch.empty((num_layers, window, bpt), dtype=torch.uint8, device=kv_buffer[0].device)
-                # Build per-token byte slices via gather: kv_buffer[layer][page_ids][:, page_offsets+0..bpt-1]
-                # Simple approach: for each token, slice [bpt] from the right page row.
-                # To minimize Python overhead, gather pages then advanced-index byte ranges.
-                byte_idx = torch.arange(bpt, device=kv_buffer[0].device).unsqueeze(0)  # [1, bpt]
-                col_idx = page_offsets.unsqueeze(1) + byte_idx                          # [window, bpt]
                 for layer_id in range(num_layers):
                     layer_buf = kv_buffer[layer_id]            # [num_pages, bytes_per_page_padded]
-                    rows = layer_buf[page_ids]                  # [window, bytes_per_page_padded]
-                    out_gpu[layer_id] = torch.gather(rows, 1, col_idx)
+                    # Advanced indexing gathers each token's SoA bytes directly.
+                    out_gpu[layer_id] = layer_buf[row_idx, col_idx]
                 logger.info(
-                    f"[FlexKV-SWA] _extract via kv_buffer fallback: window={window}, "
+                    f"[FlexKV-SWA] _extract via kv_buffer fallback (SoA): window={window}, "
                     f"layers={num_layers}, bpt={bpt}, total_bytes={out_gpu.numel()}"
                 )
                 return out_gpu.reshape(-1).cpu()
