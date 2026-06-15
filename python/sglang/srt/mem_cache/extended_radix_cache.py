@@ -457,9 +457,26 @@ class ExtendedRadixCache(BasePrefixCache):
             #
             # Instead of rolling back the alloc and aborting H2D, fall
             # back to the existing parent node (req.last_node at
-            # gpu_cached_len).  We skip inc_lock_ref because no new node
-            # was created; ``device_indices`` are still added to
+            # gpu_cached_len).  ``device_indices`` are still added to
             # ``prefix_indices`` so model forward sees them all.
+            #
+            # IMPORTANT: we MUST inc_lock_ref(req.last_node) here even
+            # though no new node was created. _check_load_completion()
+            # unconditionally calls dec_lock_ref(node) when the H2D op
+            # finishes; without a paired inc here that dec would walk
+            # the [req.last_node .. root) chain decrementing
+            # full_lock_ref / swa_lock_ref counters that no one
+            # incremented, causing:
+            #   * full_lock_ref underflow on inner radix nodes -> the
+            #     pool memory leak invariant trips at idle (full pool
+            #     missing 11776 tokens / 46 pages observed);
+            #   * swa_lock_ref underflow -> swa_evictable_size_ wraps
+            #     to a huge int (4358656 >> total=163840 observed).
+            # Locking req.last_node (a strict subset of what the
+            # normal path locks via the new leaf) is also semantically
+            # correct: it pins the prefix chain in place for the
+            # duration of the async H2D, mirroring the cache_finished_req
+            # store path which does exactly this.
             logger.info(
                 "[FlexKV] init_load_back: re-match returned root for rid=%s, "
                 "host_hit_length=%d (EAGLE bigram+page_align trimmed insert to 0). "
@@ -467,7 +484,8 @@ class ExtendedRadixCache(BasePrefixCache):
                 req.rid, host_hit_length,
             )
             new_node = req.last_node
-            load_swa_uuid = None
+            inc_result = self._inner_radixtree.inc_lock_ref(new_node)
+            load_swa_uuid = getattr(inc_result, 'swa_uuid_for_lock', None)
             # Fall through to H2D queuing below.
         else:
             # Normal path: insert created a node, lock it.
