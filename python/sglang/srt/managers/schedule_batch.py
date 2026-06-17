@@ -2762,16 +2762,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
-            # [DOUBLE-FREE-DIAG] tag the SWA-only free path from schedule_batch
-            allocator = self.token_to_kv_pool_allocator
-            if hasattr(allocator, "_pending_free_tag"):
-                allocator._pending_free_tag = (
-                    f"swa-only:schedule_batch._evict_swa rid={getattr(req, 'rid', None)} "
-                    f"old={req.swa_evicted_seqlen} new={new_swa_evicted_seqlen}"
-                )
             self.token_to_kv_pool_allocator.free_swa(free_slots)
-            if hasattr(allocator, "_pending_free_tag"):
-                allocator._pending_free_tag = None
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):

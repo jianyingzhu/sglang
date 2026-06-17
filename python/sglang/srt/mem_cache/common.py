@@ -632,16 +632,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        # [DOUBLE-FREE-DIAG] tag the post-finish overallocated cleanup
-        _alloc_obj = tree_cache.token_to_kv_pool_allocator
-        if hasattr(_alloc_obj, "_pending_free_tag"):
-            _alloc_obj._pending_free_tag = (
-                f"common.free_overallocated rid={getattr(req, 'rid', None)} "
-                f"start_p={start_p} end_p={end_p}"
-            )
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-        if hasattr(_alloc_obj, "_pending_free_tag"):
-            _alloc_obj._pending_free_tag = None
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()

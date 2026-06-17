@@ -600,75 +600,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
-            # [DOUBLE-FREE-DIAG] Track every full-pool free with a fingerprint of the
-            # indices, so a duplicate free is identifiable by repeated (min, max, sum).
-            try:
-                _idx_cpu = free_index.detach().to("cpu", torch.int64)
-                _imin = int(_idx_cpu.min().item())
-                _imax = int(_idx_cpu.max().item())
-                _isum = int(_idx_cpu.sum().item())
-                _avail_before = self.full_attn_allocator.available_size()
-                _size_total = self.full_attn_allocator.size
-                _tag = getattr(self, "_pending_free_tag", "<unset>")
-                logger.error(
-                    "[DOUBLE-FREE-DIAG] full.free PRE tag=%s numel=%d min=%d max=%d sum=%d "
-                    "avail_before=%d size=%d head=%s",
-                    _tag,
-                    int(free_index.numel()),
-                    _imin,
-                    _imax,
-                    _isum,
-                    _avail_before,
-                    _size_total,
-                    _idx_cpu[: min(8, _idx_cpu.numel())].tolist(),
-                )
-                # Record the last-seen owner per slot so a repeat free shows the
-                # previous tag — answers "who freed this slot before?".
-                if not hasattr(self, "_last_free_tag_per_slot"):
-                    import numpy as _np
-                    self._last_free_tag_per_slot = _np.empty(
-                        self.full_attn_allocator.size + 16, dtype=object
-                    )
-                _slots_np = _idx_cpu.numpy()
-                _prev_tags = {}
-                for _s in _slots_np[: min(_slots_np.size, 16)]:
-                    _prev = self._last_free_tag_per_slot[int(_s)]
-                    if _prev is not None:
-                        _prev_tags[int(_s)] = _prev
-                if _prev_tags:
-                    logger.error(
-                        "[DOUBLE-FREE-DIAG] full.free PREV-OWNERS tag=%s prev_owners=%s",
-                        _tag,
-                        _prev_tags,
-                    )
-                # Write current tag to all slots (post-free ownership).
-                for _s in _slots_np:
-                    self._last_free_tag_per_slot[int(_s)] = _tag
-            except Exception as _e:
-                logger.error("[DOUBLE-FREE-DIAG] diag-self-error: %s", _e)
-
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
-            try:
-                _avail_after = self.full_attn_allocator.available_size()
-                logger.error(
-                    "[DOUBLE-FREE-DIAG] full.free POST tag=%s avail_after=%d size=%d delta=%d",
-                    getattr(self, "_pending_free_tag", "<unset>"),
-                    _avail_after,
-                    _size_total,
-                    _avail_after - _avail_before,
-                )
-            except Exception:
-                pass
         else:
             self.free_group.append(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        ), (
-            f"[DOUBLE-FREE-DIAG] ASSERT-TRIPPED full pool: avail="
-            f"{self.full_attn_allocator.available_size()} > size="
-            f"{self.full_attn_allocator.size}; tag="
-            f"{getattr(self, '_pending_free_tag', '<unset>')}"
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
@@ -691,25 +628,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor) -> int:
-        # [DOUBLE-FREE-DIAG] log every SWA-only free with the active tag
-        try:
-            _idx_cpu = free_index.detach().to("cpu", torch.int64)
-            _imin = int(_idx_cpu.min().item()) if _idx_cpu.numel() else -1
-            _imax = int(_idx_cpu.max().item()) if _idx_cpu.numel() else -1
-            _avail_before = self.swa_attn_allocator.available_size()
-            _tag = getattr(self, "_pending_free_tag", "<unset>")
-            logger.error(
-                "[DOUBLE-FREE-DIAG] swa.free_swa PRE tag=%s numel=%d full_min=%d full_max=%d "
-                "swa_avail_before=%d swa_size=%d",
-                _tag,
-                int(free_index.numel()),
-                _imin,
-                _imax,
-                _avail_before,
-                self.swa_attn_allocator.size,
-            )
-        except Exception as _e:
-            logger.error("[DOUBLE-FREE-DIAG] free_swa diag-self-error: %s", _e)
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
@@ -717,15 +635,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if n > 0:
             self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
-        try:
-            logger.error(
-                "[DOUBLE-FREE-DIAG] swa.free_swa POST tag=%s released_swa_slots=%d swa_avail_after=%d",
-                getattr(self, "_pending_free_tag", "<unset>"),
-                n,
-                self.swa_attn_allocator.available_size(),
-            )
-        except Exception:
-            pass
         return n
 
     def backup_state(self):
