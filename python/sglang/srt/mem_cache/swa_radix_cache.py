@@ -53,6 +53,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.mem_cache import swa_evictable_diag, swa_lock_diag
+
 
 class TreeNode:
 
@@ -396,6 +398,34 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         return len(value)
 
+    def _swa_evictable_adjust(self, delta: int, tag: str, **ctx) -> None:
+        self.swa_evictable_size_ += delta
+        swa_evictable_diag.bump(self, delta, tag, **ctx)
+
+    def _tagged_free(self, indices: torch.Tensor, tag: str, **ctx) -> None:
+        """[DOUBLE-FREE-DIAG] Free with a caller tag stamped onto the allocator,
+        so swa_memory_pool.free can record per-slot ownership and surface the
+        previous tag on a duplicate free."""
+        allocator = self.token_to_kv_pool_allocator
+        prev_tag = getattr(allocator, "_pending_free_tag", None)
+        try:
+            ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items())
+            allocator._pending_free_tag = f"{tag} {ctx_str}".strip()
+            allocator.free(indices)
+        finally:
+            allocator._pending_free_tag = prev_tag
+
+    def _tagged_free_swa(self, indices: torch.Tensor, tag: str, **ctx) -> int:
+        """[DOUBLE-FREE-DIAG] Same as _tagged_free but for free_swa (SWA-only)."""
+        allocator = self.token_to_kv_pool_allocator
+        prev_tag = getattr(allocator, "_pending_free_tag", None)
+        try:
+            ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items())
+            allocator._pending_free_tag = f"swa-only:{tag} {ctx_str}".strip()
+            return allocator.free_swa(indices)
+        finally:
+            allocator._pending_free_tag = prev_tag
+
     def _mapped_swa_tail_len(self, value: torch.Tensor) -> int:
         """Length of the contiguous SWA-mapped *suffix* of ``value``.
 
@@ -443,6 +473,26 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ``swa_tombstone`` node, so every non-tombstone node stays homogeneous
         and the ``len``-based / ``free_swa``-based accounting cannot diverge.
         """
+        # [DOUBLE-FREE-DIAG] log what slots node owns BEFORE and AFTER revive
+        try:
+            _old_v = node.value
+            _old_min = int(_old_v.min().item()) if _old_v.numel() else -1
+            _old_max = int(_old_v.max().item()) if _old_v.numel() else -1
+            _new_min = int(new_value.min().item()) if new_value.numel() else -1
+            _new_max = int(new_value.max().item()) if new_value.numel() else -1
+            logger.error(
+                "[DOUBLE-FREE-DIAG] _revive_tombstone_tail node_id=%s "
+                "old_value(len=%d min=%d max=%d) -> new_value(len=%d min=%d max=%d)",
+                getattr(node, "id", None),
+                int(_old_v.numel()),
+                _old_min,
+                _old_max,
+                int(new_value.numel()),
+                _new_min,
+                _new_max,
+            )
+        except Exception as _e:
+            logger.error("[DOUBLE-FREE-DIAG] _revive_tombstone_tail diag error: %s", _e)
         node.value = new_value.clone()
         mapped_tail = self._mapped_swa_tail_len(node.value)
 
@@ -461,7 +511,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         node.swa_tombstone = False
         self.swa_lru_list.insert_mru(node)
         # node.value is now the homogeneous mapped tail, so len == mapped_tail.
-        self.swa_evictable_size_ += len(node.value)
+        self._swa_evictable_adjust(
+            len(node.value),
+            "revive_tombstone_tail",
+            node_id=getattr(node, "id", None),
+        )
 
     def reset(self) -> None:
         self.root_node = TreeNode()
@@ -523,6 +577,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
+        # [DOUBLE-FREE-DIAG] log entry to insert with slot fingerprint
+        try:
+            _v_min = int(value.min().item()) if value.numel() else -1
+            _v_max = int(value.max().item()) if value.numel() else -1
+            logger.error(
+                "[DOUBLE-FREE-DIAG] insert ENTER key_len=%d value(len=%d min=%d max=%d) "
+                "prev_prefix_len=%d swa_evicted_seqlen=%d is_eagle=%s",
+                len(key),
+                int(value.numel()),
+                _v_min,
+                _v_max,
+                prev_prefix_len,
+                swa_evicted_seqlen,
+                self.is_eagle,
+            )
+        except Exception as _e:
+            logger.error("[DOUBLE-FREE-DIAG] insert diag error: %s", _e)
+
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
         )
@@ -531,11 +603,36 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
+        # [DOUBLE-FREE-DIAG] log entry
+        try:
+            _ki_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            _ki_min = int(_ki_full.min().item()) if _ki_full.numel() else -1
+            _ki_max = int(_ki_full.max().item()) if _ki_full.numel() else -1
+            logger.error(
+                "[DOUBLE-FREE-DIAG] cache_finished_req ENTER rid=%s kv_committed_len=%d "
+                "kv_indices(len=%d min=%d max=%d) cache_protected_len=%d "
+                "req.swa_evicted_seqlen=%s is_insert=%s disable=%s",
+                getattr(req, "rid", None),
+                kv_committed_len,
+                int(_ki_full.numel()),
+                _ki_min,
+                _ki_max,
+                getattr(req, "cache_protected_len", -1),
+                getattr(req, "swa_evicted_seqlen", None),
+                is_insert,
+                self.disable,
+            )
+        except Exception as _e:
+            logger.error("[DOUBLE-FREE-DIAG] cache_finished_req diag error: %s", _e)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self._tagged_free(
+                kv_indices, "cache_finished_req.disable", rid=getattr(req, "rid", None)
+            )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -562,14 +659,33 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:page_aligned_len]
+            self._tagged_free(
+                kv_indices[old_prefix_len:page_aligned_len],
+                "cache_finished_req.no_insert.body",
+                rid=getattr(req, "rid", None),
+                old_prefix_len=old_prefix_len,
+                page_aligned_len=page_aligned_len,
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        self._tagged_free(
+            kv_indices[page_aligned_len:],
+            "cache_finished_req.unaligned_tail",
+            rid=getattr(req, "rid", None),
+            page_aligned_len=page_aligned_len,
+            kv_committed_len=kv_committed_len,
+        )
 
         # Remove req slot release the cache lock
+        swa_lock_diag.log_site(
+            "swa_cache_finished_req",
+            "dec",
+            rid=getattr(req, "rid", None),
+            node_id=getattr(req.last_node, "id", None),
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+            page_aligned_len=page_aligned_len,
+        )
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
@@ -637,12 +753,28 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
+        swa_lock_diag.log_site(
+            "swa_cache_unfinished_req:dec_old",
+            "dec",
+            rid=getattr(req, "rid", None),
+            node_id=getattr(req.last_node, "id", None),
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+            old_prefix_len=old_prefix_len,
+            new_prefix_len=new_prefix_len,
+        )
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
             skip_swa=req.swa_prefix_lock_released,
         )
         req.swa_prefix_lock_released = False
+        swa_lock_diag.log_site(
+            "swa_cache_unfinished_req:inc_new",
+            "inc",
+            rid=getattr(req, "rid", None),
+            node_id=getattr(new_last_node, "id", None),
+        )
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -687,7 +819,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 swa_slots = (
                     self._swa_slots_in_value(x.value) if not x.swa_tombstone else 0
                 )
-                self.token_to_kv_pool_allocator.free(x.value)
+                self._tagged_free(
+                    x.value,
+                    "evict.full_lru.leaf",
+                    node_id=getattr(x, "id", None),
+                    is_tombstone=x.swa_tombstone,
+                )
                 full_num_evicted += len(x.value)
                 # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
                 if not x.swa_tombstone:
@@ -725,7 +862,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_freed = self._tagged_free_swa(
+                        x.value,
+                        "evict.swa_lru.internal->tombstone",
+                        node_id=getattr(x, "id", None),
+                    )
                     swa_num_evicted += swa_freed
 
                     # 2. get the next node, update the lru lists
@@ -738,13 +879,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # Leaf still holds a full-side lock (can happen when the
                     # SWA leaf-lock early-release optimization revived a
                     # tombstoned leaf. Treat it like an internal tombstone.
-                    swa_freed = self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_freed = self._tagged_free_swa(
+                        x.value,
+                        "evict.swa_lru.leaf_full_locked",
+                        node_id=getattr(x, "id", None),
+                    )
                     swa_num_evicted += swa_freed
 
                     x_next = self.swa_lru_list.get_prev_no_lock(x)
                     self.swa_lru_list.remove_node(x)
 
-                    self.swa_evictable_size_ -= swa_freed
+                    self._swa_evictable_adjust(
+                        -swa_freed,
+                        "evict:leaf_full_locked_tombstone",
+                        node_id=getattr(x, "id", None),
+                        swa_freed=swa_freed,
+                    )
                     x.swa_tombstone = True
                 else:
                     assert (
@@ -753,7 +903,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # 1. a leaf node, free full and swa tokens
                     self._record_remove_event(x)
                     swa_slots = self._swa_slots_in_value(x.value)
-                    self.token_to_kv_pool_allocator.free(x.value)
+                    self._tagged_free(
+                        x.value,
+                        "evict.swa_lru.leaf",
+                        node_id=getattr(x, "id", None),
+                    )
                     full_num_evicted += len(x.value)
                     swa_num_evicted += swa_slots
 
@@ -785,10 +939,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return IncLockRefResult()
 
+        ev_before = self.swa_evictable_size_
+        prot_before = self.swa_protected_size_
+        leaf_id = getattr(node, "id", None)
+        nodes_locked = 0
+
         swa_lock_size = 0
         swa_uuid_for_lock = None
         while node != self.root_node:
+            nodes_locked += 1
             # lock full from node to root
+            if node.full_lock_ref < 0:
+                swa_lock_diag.log_assert_near_miss(
+                    "inc_lock_ref:full_lock_ref<0",
+                    getattr(node, "id", None),
+                    node.full_lock_ref,
+                    node.swa_lock_ref,
+                    node.swa_tombstone,
+                )
             assert (
                 node.full_lock_ref >= 0
             ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
@@ -801,12 +969,25 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # When we reach the sliding window size, we will set the swa_uuid_for_lock.
             # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
             if swa_lock_size < self.sliding_window_size:
+                if node.swa_tombstone:
+                    swa_lock_diag.log_assert_near_miss(
+                        "inc_lock_ref:swa_tombstone",
+                        getattr(node, "id", None),
+                        node.full_lock_ref,
+                        node.swa_lock_ref,
+                        node.swa_tombstone,
+                        swa_lock_size=swa_lock_size,
+                    )
                 assert (
                     not node.swa_tombstone
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
                 swa_slots = self._swa_slots_in_value(node.value)
                 if node.swa_lock_ref == 0:
-                    self.swa_evictable_size_ -= swa_slots
+                    self._swa_evictable_adjust(
+                        -swa_slots,
+                        "inc_lock_ref",
+                        node_id=getattr(node, "id", None),
+                    )
                     self.swa_protected_size_ += swa_slots
                 node.swa_lock_ref += 1
                 swa_lock_size += swa_slots
@@ -815,6 +996,19 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         node.swa_uuid = gen_swa_uuid()
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
+
+        swa_lock_diag.log_inc_result(
+            tag="swa_radix_cache.inc_lock_ref",
+            leaf_node_id=leaf_id,
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            swa_lock_size=swa_lock_size,
+            nodes_locked=nodes_locked,
+            evictable_before=ev_before,
+            evictable_after=self.swa_evictable_size_,
+            protected_before=prot_before,
+            protected_after=self.swa_protected_size_,
+            sliding_window_size=self.sliding_window_size,
+        )
         return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
 
     def dec_lock_ref(
@@ -837,8 +1031,58 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
 
+        ev_before = self.swa_evictable_size_
+        prot_before = self.swa_protected_size_
+        leaf_id = getattr(node, "id", None)
+
+        # Pre-scan: predict walk and flag risky dec (no uuid => walks SWA to root).
+        scan = node
+        pred_swa_steps = 0
+        pred_full_steps = 0
+        pred_tombstones: list = []
+        pred_zero_swa_ref: list = []
+        dec_lock_swa_scan = not skip_swa
+        while scan != self.root_node:
+            pred_full_steps += 1
+            if dec_lock_swa_scan:
+                if scan.swa_tombstone:
+                    pred_tombstones.append(getattr(scan, "id", None))
+                elif scan.swa_lock_ref <= 0:
+                    pred_zero_swa_ref.append(getattr(scan, "id", None))
+                else:
+                    pred_swa_steps += 1
+                if swa_uuid_for_lock and scan.swa_uuid == swa_uuid_for_lock:
+                    dec_lock_swa_scan = False
+            scan = scan.parent
+        if swa_lock_diag.enabled():
+            swa_lock_diag.log_site(
+                "swa_radix_cache.dec_lock_ref:pre",
+                "dec",
+                leaf_node_id=leaf_id,
+                swa_uuid_for_lock=swa_uuid_for_lock,
+                skip_swa=skip_swa,
+                pred_full_steps=pred_full_steps,
+                pred_swa_steps=pred_swa_steps,
+                pred_tombstone_nodes=pred_tombstones[:5],
+                pred_zero_swa_ref_nodes=pred_zero_swa_ref[:5],
+            )
+
         dec_lock_swa = not skip_swa
+        swa_steps = 0
+        full_steps = 0
+        hit_tombstone = False
         while node != self.root_node:
+            full_steps += 1
+            if node.full_lock_ref <= 0:
+                swa_lock_diag.log_assert_near_miss(
+                    "dec_lock_ref:full_lock_ref<=0",
+                    getattr(node, "id", None),
+                    node.full_lock_ref,
+                    node.swa_lock_ref,
+                    node.swa_tombstone,
+                    swa_uuid_for_lock=swa_uuid_for_lock,
+                    skip_swa=skip_swa,
+                )
             assert (
                 node.full_lock_ref > 0
             ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
@@ -848,22 +1092,62 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             node.full_lock_ref -= 1
 
             if dec_lock_swa:
+                if node.swa_tombstone:
+                    hit_tombstone = True
+                    swa_lock_diag.log_assert_near_miss(
+                        "dec_lock_ref:swa_tombstone",
+                        getattr(node, "id", None),
+                        node.full_lock_ref,
+                        node.swa_lock_ref,
+                        node.swa_tombstone,
+                        swa_uuid_for_lock=swa_uuid_for_lock,
+                    )
                 assert (
                     not node.swa_tombstone
                 ), f"dec_lock_ref on swa_tombstone node, {node.id=}"
+                if node.swa_lock_ref <= 0:
+                    swa_lock_diag.log_assert_near_miss(
+                        "dec_lock_ref:swa_lock_ref<=0",
+                        getattr(node, "id", None),
+                        node.full_lock_ref,
+                        node.swa_lock_ref,
+                        node.swa_tombstone,
+                        swa_uuid_for_lock=swa_uuid_for_lock,
+                        skip_swa=skip_swa,
+                    )
                 assert (
                     node.swa_lock_ref > 0
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
 
+                swa_steps += 1
                 if node.swa_lock_ref == 1:
                     swa_slots = self._swa_slots_in_value(node.value)
-                    self.swa_evictable_size_ += swa_slots
+                    self._swa_evictable_adjust(
+                        swa_slots,
+                        "dec_lock_ref",
+                        node_id=getattr(node, "id", None),
+                    )
                     self.swa_protected_size_ -= swa_slots
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
 
             node = node.parent
+
+        swa_lock_diag.log_dec_result(
+            tag="swa_radix_cache.dec_lock_ref",
+            leaf_node_id=leaf_id,
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            skip_swa=skip_swa,
+            swa_steps=swa_steps,
+            full_steps=full_steps,
+            evictable_before=ev_before,
+            evictable_after=self.swa_evictable_size_,
+            protected_before=prot_before,
+            protected_after=self.swa_protected_size_,
+            hit_tombstone=hit_tombstone,
+            pred_swa_steps=pred_swa_steps,
+        )
 
         return DecLockRefResult()
 
@@ -895,6 +1179,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
+        ev_before = self.swa_evictable_size_
+        leaf_id = getattr(node, "id", None)
+        swa_steps = 0
         while node != self.root_node:
             assert (
                 not node.swa_tombstone
@@ -911,17 +1198,35 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # swa_lru_list so SWA-eviction won't pick this tombstoned
                     # leaf (which still holds full_lock_ref > 0). The full kv
                     # stays alive until the request releases its full lock.
-                    self.token_to_kv_pool_allocator.free_swa(node.value)
+                    self._tagged_free_swa(
+                        node.value,
+                        "dec_swa_lock_only.leaf->tombstone",
+                        node_id=getattr(node, "id", None),
+                    )
                     self.swa_lru_list.remove_node(node)
                     node.swa_tombstone = True
                 else:
                     # Internal: standard protected -> evictable.
-                    self.swa_evictable_size_ += swa_slots
+                    self._swa_evictable_adjust(
+                        swa_slots,
+                        "dec_swa_lock_only:internal",
+                        node_id=getattr(node, "id", None),
+                    )
             node.swa_lock_ref -= 1
+            swa_steps += 1
 
             if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                 break
             node = node.parent
+
+        swa_lock_diag.log_dec_swa_only(
+            tag="swa_radix_cache.dec_swa_lock_only",
+            leaf_node_id=leaf_id,
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            swa_steps=swa_steps,
+            evictable_before=ev_before,
+            evictable_after=self.swa_evictable_size_,
+        )
 
     def sanity_check(self, exempt_node_ids: Optional[Set[int]] = None):
         self.full_lru_list.sanity_check(self, exempt_node_ids)
@@ -1162,6 +1467,33 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return leaf
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+        # [DOUBLE-FREE-DIAG] log split: parent_value -> (head, tail)
+        try:
+            _v = child.value
+            _v_min = int(_v.min().item()) if _v.numel() else -1
+            _v_max = int(_v.max().item()) if _v.numel() else -1
+            _head = _v[:split_len]
+            _tail = _v[split_len:]
+            _h_min = int(_head.min().item()) if _head.numel() else -1
+            _h_max = int(_head.max().item()) if _head.numel() else -1
+            _t_min = int(_tail.min().item()) if _tail.numel() else -1
+            _t_max = int(_tail.max().item()) if _tail.numel() else -1
+            logger.error(
+                "[DOUBLE-FREE-DIAG] _split_node child_id=%s tombstone=%s split_len=%d "
+                "value(len=%d min=%d max=%d) -> head(min=%d max=%d) tail(min=%d max=%d)",
+                getattr(child, "id", None),
+                child.swa_tombstone,
+                split_len,
+                int(_v.numel()),
+                _v_min,
+                _v_max,
+                _h_min,
+                _h_max,
+                _t_min,
+                _t_max,
+            )
+        except Exception as _e:
+            logger.error("[DOUBLE-FREE-DIAG] _split_node diag error: %s", _e)
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {key[split_len:].child_key(self.page_size): child}
@@ -1253,7 +1585,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         # belief can be wrong (the value may have only a mapped
                         # suffix), so revive by ACTUAL mapped tail, not by len.
                         # Free the node's stale full slots first.
-                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
+                        self._tagged_free(
+                            node.value[:prefix_len],
+                            "insert_helper.tombstone.branch1.free_node_stale",
+                            node_id=getattr(node, "id", None),
+                            prefix_len=prefix_len,
+                            swa_evicted_seqlen=swa_evicted_seqlen,
+                            total_prefix_length=total_prefix_length,
+                        )
                         self._revive_tombstone_tail(node, value[:prefix_len])
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: caller-known boundary lands inside this
@@ -1261,22 +1600,41 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         # boundary, then revive the tail by its actual mapping
                         # (a second split if the mapped suffix is shorter still).
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
-                        self.token_to_kv_pool_allocator.free(
-                            node.value[start_update_idx:prefix_len]
+                        self._tagged_free(
+                            node.value[start_update_idx:prefix_len],
+                            "insert_helper.tombstone.branch2.free_node_tail_stale",
+                            node_id=getattr(node, "id", None),
+                            start_update_idx=start_update_idx,
+                            prefix_len=prefix_len,
                         )
                         self._split_node(node.key, node, start_update_idx)
                         # The old (head) node stays swa tombstone; `node` is now
                         # the suffix to revive.
-                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])
+                        self._tagged_free(
+                            value[:start_update_idx],
+                            "insert_helper.tombstone.branch2.free_input_head",
+                            node_id=getattr(node, "id", None),
+                            start_update_idx=start_update_idx,
+                        )
                         self._revive_tombstone_tail(
                             node, value[start_update_idx:prefix_len]
                         )
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
-                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                        self._tagged_free(
+                            value[:prefix_len],
+                            "insert_helper.tombstone.branch3.free_input",
+                            node_id=getattr(node, "id", None),
+                            prefix_len=prefix_len,
+                        )
                 else:
                     # The node is not tombstone, so we don't need to update the node.
-                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    self._tagged_free(
+                        value[:prefix_len],
+                        "insert_helper.non_tombstone.free_input_dup",
+                        node_id=getattr(node, "id", None),
+                        prefix_len=prefix_len,
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1303,7 +1661,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             #    occurring in normal operation. This check is a defensive guard
             #    against unexpected eviction states from other code paths.
             if swa_evicted_seqlen == total_prefix_length + len(key):
-                self.token_to_kv_pool_allocator.free(value)
+                self._tagged_free(
+                    value,
+                    "insert_helper.tail_all_evicted",
+                    swa_evicted_seqlen=swa_evicted_seqlen,
+                    total_prefix_length=total_prefix_length,
+                    key_len=len(key),
+                )
                 return total_prefix_length
 
             if (
@@ -1342,12 +1706,45 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = key
         new_node.value = value.clone()
         new_node.swa_tombstone = swa_tombstone
+        # [DOUBLE-FREE-DIAG] log slot ownership of every new tree node
+        try:
+            _v_min = int(value.min().item()) if value.numel() else -1
+            _v_max = int(value.max().item()) if value.numel() else -1
+            logger.error(
+                "[DOUBLE-FREE-DIAG] _add_new_node node_id=%s parent_id=%s tombstone=%s "
+                "value(len=%d min=%d max=%d)",
+                getattr(new_node, "id", None),
+                getattr(parent, "id", None),
+                swa_tombstone,
+                int(value.numel()),
+                _v_min,
+                _v_max,
+            )
+        except Exception as _e:
+            logger.error("[DOUBLE-FREE-DIAG] _add_new_node diag error: %s", _e)
         parent.children[key.child_key(self.page_size)] = new_node
         self.full_lru_list.insert_mru(new_node)
         self.full_evictable_size_ += len(value)
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
-            self.swa_evictable_size_ += self._swa_slots_in_value(value)
+            swa_slots = self._swa_slots_in_value(value)
+            mapped = swa_evictable_diag.count_mapped_swa_slots(self, value)
+            if mapped != swa_slots:
+                logger.error(
+                    "[SWA-EVICT-DIAG] heterogeneous _add_new_node node will be "
+                    "created len_value=%d mapped=%d parent_id=%s — SWA evictable "
+                    "accounting will diverge from pool slots",
+                    swa_slots,
+                    mapped,
+                    getattr(parent, "id", None),
+                )
+            self._swa_evictable_adjust(
+                swa_slots,
+                "add_new_node",
+                node_id=getattr(new_node, "id", None),
+                len_value=swa_slots,
+                mapped=mapped,
+            )
         self._record_store_event(new_node)
         return new_node
 
@@ -1367,7 +1764,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            self._tagged_free(
+                node.parent.value,
+                "iter_delete_tombstone.parent",
+                parent_id=getattr(node.parent, "id", None),
+                child_id=getattr(node, "id", None),
+                parent_value_len=len(node.parent.value),
+            )
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
@@ -1384,17 +1787,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # Tombstoned leaves were never (re-)added to swa_lru_list and were
         # already removed from swa_evictable_size_ when they were tombstoned.
         if not node.swa_tombstone:
-            self.swa_evictable_size_ -= self._swa_slots_in_value(node.value)
+            self._swa_evictable_adjust(
+                -self._swa_slots_in_value(node.value),
+                "delete_leaf",
+                node_id=getattr(node, "id", None),
+            )
 
     def _tombstone_internal_node(
         self, node: TreeNode, *, swa_slots: int | None = None
     ) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
-        self.swa_evictable_size_ -= (
+        freed = (
             swa_slots
             if swa_slots is not None
             else self._swa_slots_in_value(node.value)
+        )
+        self._swa_evictable_adjust(
+            -freed,
+            "tombstone_internal_node",
+            node_id=getattr(node, "id", None),
+            swa_freed=freed,
         )
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:

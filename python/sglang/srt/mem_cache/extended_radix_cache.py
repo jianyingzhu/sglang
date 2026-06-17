@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams, InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache import swa_evictable_diag, swa_lock_diag
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -345,10 +346,26 @@ class ExtendedRadixCache(BasePrefixCache):
                 host_hit_length, is_eagle, page_size, req.rid,
             )
             try:
+                # [DOUBLE-FREE-DIAG] tag rollback path
+                if hasattr(allocator, "_pending_free_tag"):
+                    allocator._pending_free_tag = (
+                        f"extended_radix.init_load_back.rollback rid={req.rid}"
+                    )
                 allocator.free(device_indices)
+                if hasattr(allocator, "_pending_free_tag"):
+                    allocator._pending_free_tag = None
             except Exception:
                 pass
-            self._connector.release_load_state(req.rid)
+            # See note on the tail_all_evict_predicted rollback below for why
+            # release_load_state failures are caught and demoted.
+            try:
+                self._connector.release_load_state(req.rid)
+            except Exception as _e:
+                logger.warning(
+                    "[FlexKV] init_load_back: release_load_state raised after "
+                    "effective_len<=0 rollback for rid=%s: %s. Continuing.",
+                    req.rid, _e,
+                )
             return empty_indices, req.last_node
 
         # IMPORTANT: insert with the FULL key from sequence start, not a slice
@@ -392,16 +409,101 @@ class ExtendedRadixCache(BasePrefixCache):
         # SWA-homogeneous so `_swa_slots_in_value == len(value)` holds and the
         # inc/dec lock accounting stays consistent. Boundary is relative to the
         # key start (total_prefix_length is 0 for this freshly inserted prefix).
-        # Skip for eagle: the bigram view shifts the key by 1 and would misalign
-        # the boundary; eagle+hybrid-SWA is not a supported combination.
+        # swa_evicted_seqlen is in SLOT units (matches schedule_batch._evict_swa
+        # and req.swa_evicted_seqlen on the cache_finished_req path). Under EAGLE
+        # _insert_helper compares it against bigram-unit total_prefix_length, but
+        # gpu_cached_len, effective_len and _swa_tail_len() are all page-aligned
+        # so the result is page-aligned (1435 assert holds), and the 1-token
+        # bigram offset is absorbed by page_size >> 1 (256 here) — the same
+        # convention cache_finished_req already uses on the EAGLE path.
         # swa_evicted_seqlen is now ABSOLUTE from sequence start (key starts at 0):
         # the loaded tail spans [gpu_cached_len, gpu_cached_len + effective_len);
         # its head [.., gpu_cached_len + effective_len - swa_tail_len) is unmapped.
         swa_evicted_seqlen = 0
-        if has_swa_tail and window_size > 0 and not is_eagle:
+        if has_swa_tail and window_size > 0:
             swa_evicted_seqlen = gpu_cached_len + max(
                 0, effective_len - _swa_tail_len()
             )
+
+        # PRE-INSERT GUARD: detect the "tail_all_evicted with no leaf" pathology.
+        #
+        # `_inner_radixtree.insert(key)` internally applies EAGLE bigram (-1)
+        # then floor-page-align, so it sees:
+        #   key_len_inside = ((gpu_cached_len + host_hit_length - bigram_offset)
+        #                     // page_size) * page_size
+        # If `swa_evicted_seqlen >= key_len_inside`, every byte of the inserted
+        # value falls at-or-below the eviction frontier, and `_insert_helper`
+        # frees the *entire* value via its `tail_all_evicted` branch (and any
+        # tombstone-branch3 free in the loop), creating NO leaf node.
+        # Crucially, those slots are inside `device_indices`, which the caller
+        # below would still `cat` into `req.prefix_indices` and queue for H2D.
+        # The result: the same physical slots are simultaneously
+        #   (a) returned to the allocator's free list (and reusable by other
+        #       requests), and
+        #   (b) referenced by req.prefix_indices and the FlexKV H2D op.
+        # Downstream `cache_unfinished_req` then re-inserts those slots into a
+        # fresh tree node, overlapping whichever node a later request acquired
+        # them under -> tree-internal slot double-ownership -> SWA pool
+        # double-free assert in `_iteratively_delete_tombstone_leaf`.
+        #
+        # When `host_hit_length` is a page-multiple AND `is_eagle` (the common
+        # cache-hit shape), the bigram -1 + floor page_align inside insert
+        # always shrinks key by exactly one page, lining swa_evicted_seqlen up
+        # exactly with key_len_inside. This is why the bug fires reliably.
+        #
+        # Fix: detect the condition before insert and roll back the alloc, the
+        # same way the existing `effective_len <= 0` branch above does. We
+        # forfeit the H2D restore for this request (sglang re-prefills from
+        # input tokens), avoiding the double-ownership entirely.
+        trim_offset = 1 if is_eagle else 0
+        token_len_total = gpu_cached_len + host_hit_length
+        predicted_key_len_inside = (
+            (token_len_total - trim_offset) // page_size
+        ) * page_size
+        if (
+            predicted_key_len_inside > 0
+            and swa_evicted_seqlen >= predicted_key_len_inside
+        ):
+            logger.warning(
+                "[FlexKV] init_load_back: insert would tail_all_evict for rid=%s "
+                "(token_len_total=%d trim_offset=%d page_size=%d -> "
+                "predicted_key_len_inside=%d, swa_evicted_seqlen=%d, "
+                "gpu_cached_len=%d host_hit_length=%d is_eagle=%s). "
+                "Rolling back alloc to prevent freed-slot double-ownership.",
+                req.rid, token_len_total, trim_offset, page_size,
+                predicted_key_len_inside, swa_evicted_seqlen,
+                gpu_cached_len, host_hit_length, is_eagle,
+            )
+            try:
+                if hasattr(allocator, "_pending_free_tag"):
+                    allocator._pending_free_tag = (
+                        f"extended_radix.init_load_back.tail_all_evict_predicted "
+                        f"rid={req.rid}"
+                    )
+                allocator.free(device_indices)
+                if hasattr(allocator, "_pending_free_tag"):
+                    allocator._pending_free_tag = None
+            except Exception:
+                pass
+            # release_load_state may itself raise (FlexKV-side bugs like the
+            # cancel_task/cancel_tasks naming mismatch in KVManager). The GPU
+            # slots are already returned to the allocator above, so the only
+            # remaining cleanup is FlexKV-server-side bookkeeping; if that
+            # fails the server task will eventually time out. Don't let that
+            # propagate to the scheduler — it would crash the whole DP rank
+            # for what is, by design, an optimisation-only abort path.
+            try:
+                self._connector.release_load_state(req.rid)
+            except Exception as _e:
+                logger.warning(
+                    "[FlexKV] init_load_back: release_load_state raised after "
+                    "tail_all_evict_predicted rollback for rid=%s: %s. "
+                    "Continuing — GPU slots are already freed; FlexKV server "
+                    "task will time out.",
+                    req.rid, _e,
+                )
+            return empty_indices, req.last_node
+
         try:
             self._inner_radixtree.insert(
                 InsertParams(
@@ -484,12 +586,22 @@ class ExtendedRadixCache(BasePrefixCache):
                 req.rid, host_hit_length,
             )
             new_node = req.last_node
-            inc_result = self._inner_radixtree.inc_lock_ref(new_node)
+            inc_result = self._flexkv_inc_lock(
+                new_node,
+                "init_load_back:root_fallback",
+                rid=req.rid,
+                host_hit_length=host_hit_length,
+            )
             load_swa_uuid = getattr(inc_result, 'swa_uuid_for_lock', None)
             # Fall through to H2D queuing below.
         else:
             # Normal path: insert created a node, lock it.
-            inc_result = self._inner_radixtree.inc_lock_ref(new_node)
+            inc_result = self._flexkv_inc_lock(
+                new_node,
+                "init_load_back:normal",
+                rid=req.rid,
+                host_hit_length=host_hit_length,
+            )
             load_swa_uuid = getattr(inc_result, 'swa_uuid_for_lock', None)
 
         # NOTE: device_indices may be longer than match_result.device_indices
@@ -517,6 +629,15 @@ class ExtendedRadixCache(BasePrefixCache):
         if not hasattr(self, '_load_queue_swa_uuids'):
             self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
         self._load_queue_swa_uuids[id(self._load_queue[-1])] = load_swa_uuid
+        swa_lock_diag.log_site(
+            "init_load_back:queued",
+            "inc",
+            rid=req.rid,
+            node_id=getattr(new_node, "id", None),
+            load_swa_uuid=load_swa_uuid,
+            host_hit_length=host_hit_length,
+            device_indices_len=device_indices.numel() if hasattr(device_indices, "numel") else len(device_indices),
+        )
 
         req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
         req.last_node = new_node
@@ -561,6 +682,18 @@ class ExtendedRadixCache(BasePrefixCache):
             token_ids = token_ids[:page_aligned_len]
             if len(token_ids) > 0 and req_id is not None:
                 cache_to_connector = True
+
+        # Inner cache_finished_req dec_lock_ref's req.last_node (prefill lock).
+        if cache_to_connector or is_insert:
+            swa_lock_diag.log_site(
+                "cache_finished_req:inner_before",
+                "dec",
+                rid=getattr(req, "rid", None),
+                node_id=getattr(req.last_node, "id", None),
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
+                skip_swa=getattr(req, "swa_prefix_lock_released", False),
+                cache_to_connector=cache_to_connector,
+            )
 
         # Let the inner radix tree do insert + free duplicates + dec_lock_ref.
         self._inner_radixtree.cache_finished_req(req, is_insert=is_insert, **kwargs)
@@ -614,7 +747,13 @@ class ExtendedRadixCache(BasePrefixCache):
         # MUST be passed to dec_lock_ref so the SWA-side release walks the
         # exact same range. Plain RadixCache returns the result but ignores
         # the SWA fields, so this also works there.
-        inc_result = self._inner_radixtree.inc_lock_ref(new_last_node)
+        inc_result = self._flexkv_inc_lock(
+            new_last_node,
+            "cache_finished_req:flexkv_store",
+            rid=req.rid,
+            token_count=len(token_ids),
+            node_id=getattr(new_last_node, "id", None),
+        )
         swa_uuid_for_lock = getattr(inc_result, 'swa_uuid_for_lock', None)
 
         task_id = self._load_task_id_counter
@@ -636,6 +775,29 @@ class ExtendedRadixCache(BasePrefixCache):
             return
         self._check_store_completion()
         self._check_load_completion()
+        if swa_lock_diag.enabled() and (
+            len(self._ongoing_load_tasks) + len(self._ongoing_store_tasks) == 0
+        ):
+            # Lightweight heartbeat when quiescent — grep SUMMARY near end of run.
+            if not hasattr(self, "_swa_lock_diag_idle_ticks"):
+                self._swa_lock_diag_idle_ticks = 0
+            self._swa_lock_diag_idle_ticks += 1
+            if self._swa_lock_diag_idle_ticks % 500 == 0:
+                swa_lock_diag.log_summary(reason="extended_radix_cache idle heartbeat")
+            if (
+                swa_evictable_diag.enabled()
+                and self._swa_lock_diag_idle_ticks % 2000 == 0
+            ):
+                snap = swa_evictable_diag.reconcile(self._inner_radixtree)
+                if (
+                    snap.get("phantom_evictable")
+                    or snap.get("heterogeneous_node_count")
+                    or snap.get("pool_accounting_gap")
+                ):
+                    swa_evictable_diag.log_reconcile(
+                        self._inner_radixtree,
+                        reason="extended_radix_cache idle heartbeat",
+                    )
 
     # Alias for compatibility with scheduler (which calls check_hicache_events)
     def check_hicache_events(self):
@@ -664,6 +826,34 @@ class ExtendedRadixCache(BasePrefixCache):
 
     # -- Private helpers --
 
+    def _flexkv_inc_lock(
+        self,
+        node: TreeNode,
+        tag: str,
+        **ctx,
+    ):
+        ctx.setdefault("node_id", getattr(node, "id", None))
+        swa_lock_diag.log_site(tag, "inc", **ctx)
+        return self._inner_radixtree.inc_lock_ref(node)
+
+    def _flexkv_dec_lock(
+        self,
+        node: TreeNode,
+        swa_uuid,
+        tag: str,
+        **ctx,
+    ):
+        ctx.setdefault("node_id", getattr(node, "id", None))
+        ctx.setdefault("swa_uuid_for_lock", swa_uuid)
+        swa_lock_diag.log_site(tag, "dec", **ctx)
+        try:
+            from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+
+            params = DecLockRefParams(swa_uuid_for_lock=swa_uuid)
+            return self._inner_radixtree.dec_lock_ref(node, params)
+        except (ImportError, TypeError):
+            return self._inner_radixtree.dec_lock_ref(node)
+
     def _check_store_completion(self) -> None:
         completed_ids = self._connector.check_completed_store_tasks()
         for task_id in completed_ids:
@@ -675,15 +865,13 @@ class ExtendedRadixCache(BasePrefixCache):
                 node, swa_uuid = entry
             else:
                 node, swa_uuid = entry, None
-            # On SWARadixCache, dec_lock_ref needs DecLockRefParams to know
-            # how far up the SWA chain to walk; on plain RadixCache the
-            # extra param is ignored.
-            try:
-                from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-                params = DecLockRefParams(swa_uuid_for_lock=swa_uuid)
-                self._inner_radixtree.dec_lock_ref(node, params)
-            except (ImportError, TypeError):
-                self._inner_radixtree.dec_lock_ref(node)
+            self._flexkv_dec_lock(
+                node,
+                swa_uuid,
+                "check_store_completion",
+                task_id=task_id,
+                node_id=getattr(node, "id", None),
+            )
 
     def _check_load_completion(self) -> None:
         completed_ids = self._connector.check_completed_load_tasks()
@@ -697,12 +885,13 @@ class ExtendedRadixCache(BasePrefixCache):
                     node, swa_uuid = entry
                 else:
                     node, swa_uuid = entry, None
-                try:
-                    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-                    params = DecLockRefParams(swa_uuid_for_lock=swa_uuid)
-                    self._inner_radixtree.dec_lock_ref(node, params)
-                except (ImportError, TypeError):
-                    self._inner_radixtree.dec_lock_ref(node)
+                self._flexkv_dec_lock(
+                    node,
+                    swa_uuid,
+                    "check_load_completion",
+                    task_id=task_id,
+                    node_id=getattr(node, "id", None),
+                )
 
     # -- Pass-through methods --
 
@@ -710,9 +899,11 @@ class ExtendedRadixCache(BasePrefixCache):
         return self._inner_radixtree.insert(*args, **kwargs)
 
     def inc_lock_ref(self, *args, **kwargs):
+        swa_lock_diag.log_site("extended_radix_cache.pass_through", "inc")
         return self._inner_radixtree.inc_lock_ref(*args, **kwargs)
 
     def dec_lock_ref(self, *args, **kwargs):
+        swa_lock_diag.log_site("extended_radix_cache.pass_through", "dec")
         return self._inner_radixtree.dec_lock_ref(*args, **kwargs)
 
     def cache_unfinished_req(self, *args, **kwargs):

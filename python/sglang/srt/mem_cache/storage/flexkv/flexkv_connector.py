@@ -338,6 +338,15 @@ class FlexKVConnector(BaseKVConnector):
                 gpu_register_port=self.flexkv_config.gpu_register_port,
             )
             self.kv_manager.start()
+            swa_cfg = cache_config.swa
+            logger.info(
+                f"[FlexKV-SWA-DIAG] KVManager ready{self._rank_label}: "
+                f"server_client_mode={self.kv_manager.server_client_mode}, "
+                f"dp_size={model_config.dp_size}, "
+                f"swa_enabled={swa_cfg is not None and swa_cfg.enabled}, "
+                f"swa_via_rpc={self.kv_manager.server_client_mode}, "
+                f"swa_unavailable_reason={self.kv_manager.swa_unavailable_reason()!r}"
+            )
             logger.info(
                 f"[FlexKV] Creating KVManager{self._rank_label}: "
                 f"server_recv_port={self.flexkv_config.server_recv_port}, "
@@ -612,11 +621,19 @@ class FlexKVConnector(BaseKVConnector):
                             )
                             swa_avail = False
                         # INFO-level so we can see at runtime whether SWA path is even taken
+                        swa_reason = (
+                            self.kv_manager.swa_unavailable_reason()
+                            if hasattr(self.kv_manager, "swa_unavailable_reason")
+                            else None
+                        )
                         logger.info(
                             f"[FlexKV-SWA] match: hit_length={hit_length}, "
                             f"swa_available={swa_avail}, "
                             f"window_size={self._swa_window_size}, "
-                            f"prod_mgr_exists={self.kv_manager._get_swa_production_manager() is not None}"
+                            f"prod_mgr_exists={self.kv_manager._get_swa_production_manager() is not None}, "
+                            f"server_client_mode={getattr(self.kv_manager, 'server_client_mode', 'n/a')}, "
+                            f"swa_via_rpc={getattr(self.kv_manager, 'server_client_mode', False)}, "
+                            f"swa_unavailable_reason={swa_reason!r}"
                         )
 
                         if swa_avail:
@@ -641,7 +658,9 @@ class FlexKVConnector(BaseKVConnector):
 
                             logger.info(
                                 f"[FlexKV-SWA] Reduced hit_length {original_hit} -> {hit_length} "
-                                f"due to missing SWA (no H2D for this request)"
+                                f"due to missing SWA (no H2D for this request); "
+                                f"cause: main KV hit on CPU cache but SWA never stored "
+                                f"(see [KVManager-SWA-DIAG] / swa_put put_ok=False)"
                             )
 
                             # Cancel the original task since hit_length changed
@@ -965,11 +984,20 @@ class FlexKVConnector(BaseKVConnector):
                     swa_data = self._extract_swa_from_gpu(kv_indices)
                     if swa_data is not None:
                         put_ok = self.kv_manager.swa_put(token_ids_np, swa_data)
+                        swa_reason = (
+                            self.kv_manager.swa_unavailable_reason()
+                            if not put_ok and hasattr(self.kv_manager, "swa_unavailable_reason")
+                            else None
+                        )
+                        if put_ok and getattr(self.kv_manager, "server_client_mode", False):
+                            swa_reason = "stored via server RPC"
                         logger.info(
                             f"[FlexKV-SWA] swa_put: rid_token_count={len(token_ids_np)}, "
                             f"swa_data_shape={getattr(swa_data, 'shape', 'unknown')}, "
                             f"swa_data_numel={getattr(swa_data, 'numel', lambda: -1)() if hasattr(swa_data, 'numel') else len(swa_data)}, "
-                            f"put_ok={put_ok}"
+                            f"put_ok={put_ok}, "
+                            f"server_client_mode={getattr(self.kv_manager, 'server_client_mode', 'n/a')}, "
+                            f"fail_reason={swa_reason!r}"
                         )
                     else:
                         logger.warning(
@@ -1196,6 +1224,14 @@ class FlexKVConnector(BaseKVConnector):
             full_indices: Full KV cache indices allocated for this request.
             swa_cpu_data: Flat CPU tensor containing SWA data from FlexKV pool.
         """
+        # In server-client mode (dp_size > 1, e.g. tp=8 + dp=8 + enable-dp-attention),
+        # ``kv_manager.swa_get`` returns a numpy.ndarray over zmq RPC (numpy is faster
+        # to ship across processes than torch.Tensor — by design). The body below
+        # uses torch APIs (`.numel()`, `.to(device=...)`, `.view(...)`), so wrap
+        # numpy as a zero-copy tensor view here. In-process mode already passes a
+        # torch.Tensor and skips this branch.
+        if isinstance(swa_cpu_data, np.ndarray):
+            swa_cpu_data = torch.from_numpy(np.ascontiguousarray(swa_cpu_data))
         if self._swa_kv_pool is None:
             return
         if self._swa_window_size <= 0:

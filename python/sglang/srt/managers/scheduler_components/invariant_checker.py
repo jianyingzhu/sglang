@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache import swa_evictable_diag, swa_lock_diag
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
@@ -235,6 +236,14 @@ class SchedulerInvariantChecker:
             )
 
     def _report_leak(self, pool_name: str, token_msg: str):
+        if swa_lock_diag.enabled():
+            swa_lock_diag.log_summary(reason=f"pool_leak_detected:{pool_name}")
+        if swa_evictable_diag.enabled() and self.is_hybrid_swa:
+            inner = getattr(self.tree_cache, "_inner_radixtree", self.tree_cache)
+            if hasattr(inner, "swa_evictable_size"):
+                swa_evictable_diag.log_reconcile(
+                    inner, reason=f"pool_leak_detected:{pool_name}"
+                )
         msg = f"{pool_name} memory leak detected! {token_msg}"
         raise_error_or_warn(
             self,
