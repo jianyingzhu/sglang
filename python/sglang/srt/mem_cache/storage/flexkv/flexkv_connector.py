@@ -98,6 +98,22 @@ class FlexKVConnector(BaseKVConnector):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        print(
+            f"[FlexKV] kvcache type={type(kvcache).__name__}, "
+            f"keys={sorted(vars(kvcache).keys())}"
+        )
+
+        attr = ["c4_kv_pool", "c128_kv_pool", "swa_kv_pool", "c4_indexer_kv_pool"]
+        for _attr in attr:
+            _sub_pool = getattr(kvcache, _attr, None)
+            if _sub_pool is not None:
+                print(
+                    f"[FlexKV] kvcache.{_attr} "
+                    f"type={type(_sub_pool).__name__}, "
+                    f"keys={sorted(vars(_sub_pool).keys())}"
+                )
+
+
         sglang_model_config = ModelConfig.from_server_args(server_args)
 
         # ---- Initialize FlexKV config ----
@@ -138,12 +154,13 @@ class FlexKVConnector(BaseKVConnector):
 
 
         # ---- Align block counts on unified group (single all_reduce MIN) ----
+        # TODO: if we need sync the block counts ???
         for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
             _orig = getattr(self.flexkv_config.cache_config, _attr)
             if _orig is None or _orig <= 0:
                 continue
             _aligned = self._sync_ctx.all_reduce_min(_orig)
-            logger.debug(
+            logger.info(
                 f"[FlexKV] Block count alignment{self._rank_label}: "
                 f"attr={_attr}, {_orig} -> {_aligned}"
             )
@@ -236,8 +253,7 @@ class FlexKVConnector(BaseKVConnector):
                 "dtype": torch.uint8,
             })
 
-            # c4_indexer_kv_pool is optional (older DSv4 configs may not have
-            # the indexer split).  It uses the same compress_ratio=4 layer set
+            # c4_indexer_kv_pool is optional.  It uses the same compress_ratio=4 layer set
             # as c4_kv_pool but stores indexer K (uint8 packed) instead of KV.
             if hasattr(kvcache, "c4_indexer_kv_pool"):
                 indexer_pool = kvcache.c4_indexer_kv_pool
@@ -250,6 +266,7 @@ class FlexKVConnector(BaseKVConnector):
                     # Compute per-token bytes from buffer shape so we don't
                     # duplicate the formula in DeepSeekV4IndexerPool.
                     sample = indexer_buffers_pool[0]
+                    print("[FlexKV] sample: ", sample.shape, "indexer_pool.page_size: ", indexer_pool.page_size)
                     bytes_per_page = sample.shape[1]
                     bytes_per_token_idx = bytes_per_page // indexer_pool.page_size
                     self._dsv4_layer_groups_info.append({
@@ -1676,27 +1693,27 @@ class FlexKVConnector(BaseKVConnector):
             else:
                 return
 
-        if not recompute_cache_block_counts(model_config, cache_config):
-            return
+        if recompute_cache_block_counts(model_config, cache_config):
+            logger.info(
+                f"[FlexKV] Cache block counts aligned to layer_groups{self._rank_label}: "
+                f"num_cpu_blocks {old_cpu} -> {cache_config.num_cpu_blocks}, "
+                f"num_groups={len(model_config.layer_groups)}"
+            )
+            # TODO： if we need sync the block counts ???
+            for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
+                _orig = getattr(cache_config, _attr)
+                if _orig is None or _orig <= 0:
+                    continue
+                _aligned = self._sync_ctx.all_reduce_min(_orig)
+                if _aligned != _orig:
+                    logger.info(
+                        f"[FlexKV] Block count MIN alignment '{_attr}' after "
+                        f"layer_groups recompute{self._rank_label}: "
+                        f"{_orig} -> {_aligned}"
+                    )
+                setattr(cache_config, _attr, _aligned)
 
-        logger.info(
-            f"[FlexKV] Cache block counts aligned to layer_groups{self._rank_label}: "
-            f"num_cpu_blocks {old_cpu} -> {cache_config.num_cpu_blocks}, "
-            f"num_groups={len(model_config.layer_groups)}"
-        )
-
-        for _attr in ("num_cpu_blocks", "num_ssd_blocks", "num_remote_blocks"):
-            _orig = getattr(cache_config, _attr)
-            if _orig is None or _orig <= 0:
-                continue
-            _aligned = self._sync_ctx.all_reduce_min(_orig)
-            if _aligned != _orig:
-                logger.info(
-                    f"[FlexKV] Block count MIN alignment '{_attr}' after "
-                    f"layer_groups recompute{self._rank_label}: "
-                    f"{_orig} -> {_aligned}"
-                )
-            setattr(cache_config, _attr, _aligned)
+        return
 
     def _register_with_retry(
         self,
@@ -2199,11 +2216,66 @@ class FlexKVConnector(BaseKVConnector):
             is_mla=gpu_layouts[0].is_mla,
         )
 
+        # ---- SWA dedicated pool registration (channel B) ----
+        # IMPORTANT: this runs inside _register_to_server_dsv4, which is called
+        # from _register_with_retry() EARLY in __init__ -- BEFORE self._kvcache
+        # and self._swa_kv_pool are assigned. So we must source the SWA pool
+        # from self._dsv4_kvcache (set at line ~207 during DSv4 detection,
+        # which always precedes registration), NOT from self._kvcache /
+        # self._swa_kv_pool (assigned later and absent here -> AttributeError).
+        swa_caches = None
+        swa_layout = None
+        dsv4_kvcache = getattr(self, '_dsv4_kvcache', None)
+        swa_pool = getattr(dsv4_kvcache, 'swa_kv_pool', None) if dsv4_kvcache is not None else None
+        logger.info(
+            f"[FlexKV-SWA] swa_pool source=_dsv4_kvcache, "
+            f"present={swa_pool is not None}"
+        )
+        if swa_pool is not None and getattr(swa_pool, 'kv_buffer', None):
+            swa_buffers = swa_pool.kv_buffer
+            swa_buf0 = swa_buffers[0]
+            assert swa_buf0.ndim == 2, (
+                f"[FlexKV-SWA] swa buffer must be 2D [num_pages, "
+                f"bytes_per_page_padded], got shape={swa_buf0.shape}"
+            )
+            swa_num_pages = swa_buf0.shape[0]
+            swa_bytes_per_page_padded = swa_buf0.shape[1]
+            swa_sub_page_size = int(getattr(swa_pool, 'page_size'))
+            if swa_bytes_per_page_padded % swa_sub_page_size != 0:
+                raise RuntimeError(
+                    f"[FlexKV-SWA] bytes_per_page_padded="
+                    f"{swa_bytes_per_page_padded} not divisible by "
+                    f"swa_page_size={swa_sub_page_size}; breaks stride math."
+                )
+            swa_effective_head_size = swa_bytes_per_page_padded // swa_sub_page_size
+            swa_caches = list(swa_buffers)
+            swa_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(swa_buffers),
+                num_block=swa_num_pages,
+                tokens_per_block=swa_sub_page_size,
+                num_head=1,
+                head_size=swa_effective_head_size,
+                is_mla=True,
+            )
+            logger.info(
+                f"[FlexKV-SWA] Prepared SWA dedicated pool registration: "
+                f"num_layers={len(swa_buffers)}, num_pages={swa_num_pages}, "
+                f"swa_page_size={swa_sub_page_size}, "
+                f"bytes_per_page_padded={swa_bytes_per_page_padded}, "
+                f"effective_head_size={swa_effective_head_size}"
+            )
+        else:
+            logger.info(
+                "[FlexKV-SWA] No SWA pool present; skipping SWA registration"
+            )
+
         logger.info(
             f"[FlexKV-DSv4] Submitting registration: "
             f"num_groups={len(layer_groups)}, "
             f"total_buffers={len(all_gpu_blocks)}, "
-            f"page_size_full={page_size_full}, is_mla={is_mla}"
+            f"page_size_full={page_size_full}, is_mla={is_mla}, "
+            f"swa={'yes' if swa_caches else 'no'}"
         )
         self.tp_client.register_to_server(
             kv_caches=all_gpu_blocks,
@@ -2211,9 +2283,12 @@ class FlexKVConnector(BaseKVConnector):
             layer_groups=layer_groups,
             gpu_layouts=gpu_layouts,
             handles_per_group=handles_per_group,
+            swa_caches=swa_caches,
+            swa_layout=swa_layout,
         )
         logger.info(
             "[FlexKV-DSv4] Registered DSv4 multi-pool KV caches to server"
+            + (" (+ SWA dedicated pool)" if swa_caches else "")
         )
 
     def _init_layer_transfer_components(self):
