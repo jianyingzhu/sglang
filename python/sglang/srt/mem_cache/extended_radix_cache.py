@@ -132,15 +132,6 @@ class ExtendedRadixCache(BasePrefixCache):
         token_mask = torch.zeros(n, dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
-        # SWA mask: True where a token needs its sliding-window KV brought in
-        # from the host (FlexKV convention: 1 = missing on the GPU SWA pool).
-        # The device-hit prefix [:device_indices.numel()] is present in the
-        # Full-KV GPU pool, but its SWA window may have been evicted from the
-        # (much smaller) SWA pool — full_to_swa_index_mapping maps those slots
-        # to 0. Marking them lets the connector restore SWA even on a FULL GPU
-        # hit (where token_mask is all-False and no full H2D would fire).
-        # Tokens beyond the device hit are left False here: their SWA rides the
-        # full H2D via swa_slot_mappings in start_load_kv.
         swa_mask = None
         allocator = self._inner_radixtree.token_to_kv_pool_allocator
         if self.supports_swa() and device_indices.numel() > 0:
@@ -716,7 +707,7 @@ class ExtendedRadixCache(BasePrefixCache):
         return self._inner_radixtree.dec_lock_ref(*args, **kwargs)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, *args, **kwargs):
-        self._inner_radixtree.cache_unfinished_req(req, chunked=chunked)
+        self._inner_radixtree.cache_unfinished_req(req, chunked=chunked, *args, **kwargs)
 
         if self._connector is None or chunked:
             return

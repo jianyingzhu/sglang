@@ -83,13 +83,8 @@ class FlexKVConnector(BaseKVConnector):
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
     ):
-        # Normalize optional rank args. sglang passes dp_rank=None when DP
-        # attention/routing is off (dp_size=1, enable_dp_attention=False, no
-        # SGLANG_DP_RANK) — the "no DP sharding" case, semantically dp_rank 0.
-        # FlexKVConfig.post_init_from_sglang_config forwards these into a
-        # pybind extension whose signature is `int`, so a None would raise
-        # TypeError and get the whole connector downgraded to "no connector".
-        # Our signature already advertises Optional[int]; honor that contract.
+        # Normalize optional rank args. sglang passes dp_rank=None when DP attention/routing is off (dp_size=1, enable_dp_attention=False, no SGLANG_DP_RANK)
+        # FlexKVConfig.post_init_from_sglang_config forwards these into a pybind extension whose signature is `int`, so a None would raise TypeError
         dp_rank = 0 if dp_rank is None else dp_rank
         attn_cp_rank = 0 if attn_cp_rank is None else attn_cp_rank
 
