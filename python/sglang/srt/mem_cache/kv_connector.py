@@ -42,6 +42,7 @@ class BaseKVConnector(ABC):
         self,
         token_ids: List[int],
         token_mask: torch.Tensor,
+        swa_mask: Optional[torch.Tensor] = None,
         update_state_for_load: bool = False,
         rid: Optional[str] = None,
     ) -> int:
@@ -50,6 +51,9 @@ class BaseKVConnector(ABC):
         Args:
             token_ids: Full token id sequence.
             token_mask: Boolean mask; True for positions to match.
+            swa_mask: Optional boolean mask; True where a token's sliding-window
+                KV is missing on the GPU SWA pool and must be restored from the
+                host. None when the model has no SWA pool.
             update_state_for_load: Lock internal state until the load is
                 started or cancelled via *rid*.
             rid: Request id for tracking the subsequent load task.

@@ -132,9 +132,19 @@ class ExtendedRadixCache(BasePrefixCache):
         token_mask = torch.zeros(n, dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
+        swa_mask = None
+        allocator = self._inner_radixtree.token_to_kv_pool_allocator
+        if self.supports_swa() and device_indices.numel() > 0:
+            mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+            if mapping is not None:
+                swa_slots = mapping[device_indices]
+                swa_mask = torch.zeros(n, dtype=torch.bool)
+                swa_mask[: device_indices.numel()] = (swa_slots == 0).cpu()
+
         new_hit_length = self._connector.get_new_hit_length(
             token_ids=token_ids_for_connector,
             token_mask=token_mask,
+            swa_mask=swa_mask,
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
         )
@@ -696,8 +706,83 @@ class ExtendedRadixCache(BasePrefixCache):
     def dec_lock_ref(self, *args, **kwargs):
         return self._inner_radixtree.dec_lock_ref(*args, **kwargs)
 
-    def cache_unfinished_req(self, *args, **kwargs):
-        return self._inner_radixtree.cache_unfinished_req(*args, **kwargs)
+    def cache_unfinished_req(self, req: Req, chunked: bool = False, *args, **kwargs):
+        self._inner_radixtree.cache_unfinished_req(req, chunked=chunked, *args, **kwargs)
+
+        if self._connector is None or chunked:
+            return
+
+        req_id = req.req_pool_idx
+        # Store the page-aligned prefix that has been committed to the GPU tree
+        # so far. Mirrors cache_finished_req, but uses fill_ids (the tokens
+        # filled up to this point) rather than the committed output.
+        token_ids = list(req.fill_ids)
+        page_aligned_len = (len(token_ids) // self.page_size) * self.page_size
+        token_ids = token_ids[:page_aligned_len]
+        if len(token_ids) == 0 or req_id is None:
+            return
+
+        # Re-match to resolve the actual leaf node and its tree-owned kv_indices
+        # AFTER the inner insert above. These indices are protected by lock_ref
+        # (not the transient req_to_token_pool snapshot), so they survive the
+        # in-flight D2H transfer.
+        radix_key = RadixKey(token_ids, req.extra_key)
+        match_result = self._inner_radixtree.match_prefix(
+            MatchPrefixParams(key=radix_key)
+        )
+        new_last_node = match_result.last_device_node
+        if new_last_node is None or new_last_node is self._inner_radixtree.root_node:
+            return
+
+        kv_indices = match_result.device_indices
+        if kv_indices is None or kv_indices.numel() == 0:
+            return
+
+        # The radix tree may return fewer indices than tokens (EAGLE bigram /
+        # page alignment). Truncate token_ids to match; skip if nothing remains.
+        if len(token_ids) > kv_indices.numel():
+            token_ids = token_ids[: kv_indices.numel()]
+        if len(token_ids) == 0:
+            return
+        if len(token_ids) != kv_indices.numel():
+            logger.warning(
+                "[FlexKV] cache_unfinished_req: length mismatch! "
+                "len(token_ids)=%d, kv_indices.numel()=%d, skipping store",
+                len(token_ids), kv_indices.numel(),
+            )
+            return
+
+        inc_result = self._flexkv_inc_lock(
+            new_last_node,
+            "cache_unfinished_req:flexkv_store",
+            rid=req.rid,
+            token_count=len(token_ids),
+            node_id=getattr(new_last_node, "id", None),
+        )
+        swa_uuid_for_lock = getattr(inc_result, 'swa_uuid_for_lock', None)
+
+        task_id = self._load_task_id_counter
+        self._load_task_id_counter += 1
+
+        try:
+            self._connector.start_store_kv(
+                task_id=task_id,
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+            )
+        except Exception as e:
+            logger.error(f"[FlexKV] cache_unfinished_req failed to store KV: {e}")
+            # Roll back the lock we just took so it is not leaked (no store task
+            # will ever complete to release it).
+            self._flexkv_dec_lock(
+                new_last_node,
+                swa_uuid_for_lock,
+                "cache_unfinished_req:store_failed",
+                node_id=getattr(new_last_node, "id", None),
+            )
+            return
+
+        self._ongoing_store_tasks[task_id] = (new_last_node, swa_uuid_for_lock)
 
     def evictable_size(self):
         inner = self._inner_radixtree
