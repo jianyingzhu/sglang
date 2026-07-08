@@ -64,7 +64,6 @@ if cudart:
 
 # ---- FlexKV Connector ----
 
-
 class FlexKVConnector(BaseKVConnector):
     """KV cache connector backed by FlexKV's distributed cache system.
 
@@ -457,25 +456,25 @@ class FlexKVConnector(BaseKVConnector):
 
         # SWA config (cache_config.swa + enable_swa_transfer) is populated by
         # FlexKVConfig.post_init_from_sglang_config for DSv4 with the correct
-        # padded bytes-per-token; the connector no longer derives it. We only
-        # read window_size below for the trailing-window logic.
-        self._swa_window_size = (
-            cache_config.swa.window_size
-            if cache_config.swa is not None and cache_config.swa.enabled
-            else 0
-        )
+        # padded bytes-per-token; the connector no longer derives it.
+        #
+        # NOTE: FlexKV manages SWA at PAGE granularity — one pool slot stores
+        # exactly one ``tokens_per_block`` page and the SWA "window" degenerates
+        # to a single trailing page (see SWAPoolConfig / radixtree SWA lock).
+        # There is therefore no ``window_size`` field on SWAPoolConfig anymore;
+        # the geometry is fully described by ``bytes_per_token_per_layer`` and
+        # the page size. (The old ``self._swa_window_size`` read of
+        # ``cache_config.swa.window_size`` raised AttributeError and silently
+        # disabled the whole connector — do not reintroduce it.)
         self._swa_bytes_per_token_per_layer = (
             cache_config.swa.bytes_per_token_per_layer
             if cache_config.swa is not None and hasattr(cache_config.swa, 'bytes_per_token_per_layer')
             else 0
         )
         self._device = kv_caches[0].device if kv_caches else torch.device("cuda")
-        # rid -> token_ids prefix for pending SWA loads
-        self._pending_swa_token_ids: Dict[str, np.ndarray] = {}
         if self._swa_kv_pool is not None:
             logger.info(
                 f"[FlexKV-SWA] Detected SWA KV pool on kvcache, "
-                f"window_size={self._swa_window_size}, "
                 f"bytes_per_token_per_layer={self._swa_bytes_per_token_per_layer}, "
                 f"swa_enabled_in_cache_config={cache_config.swa is not None and cache_config.swa.enabled}"
             )
@@ -534,7 +533,6 @@ class FlexKVConnector(BaseKVConnector):
         self,
         token_ids: List[int],
         token_mask: torch.Tensor,
-        swa_mask: Optional[torch.Tensor] = None,
         update_state_for_load: bool = False,
         rid: Optional[str] = None,
     ) -> int:
@@ -546,40 +544,26 @@ class FlexKVConnector(BaseKVConnector):
         #       TP/CP group's behalf and broadcast the result to the rest of the group.
         if self._sync_ctx.is_sync_leader:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            # SWA-aware match when a dedicated SWA GPU pool is registered:
-            # get_match_swa internally clamps the Full-KV transfer to the SWA-reusable prefix (usable = min(full_hit, swa_hit)) and returns (task_id, mask_full, mask_swa).
-            if self._swa_kv_pool is not None:
-                # swa_mask marks device-hit tokens whose SWA window was evicted from the GPU SWA pool and must be restored from the host.
-                result = self.kv_manager.get_match_swa(
-                    token_ids=token_ids_np,
-                    full_mask=token_mask,
-                    swa_mask=swa_mask,
-                )
-                if result is None:
-                    logger.warning(
-                        "[FlexKV] get_match_swa returned None, treating as no hit"
-                    )
-                    flexkv_task_id = -1
-                    hit_length = 0
-                    matched_mask_swa = None
-                else:
-                    flexkv_task_id, matched_mask, matched_mask_swa = result
-                    hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
-            else:
-                # Non-SWA (MLA / MHA / NSA): plain single-mask match, unchanged.
-                result = self.kv_manager.get_match(
-                    token_ids=token_ids_np,
-                    token_mask=token_mask,
-                )
-                matched_mask_swa = None
+            # A single get_match covers both the plain (MLA / MHA / NSA) and the
+            # SWA-aware path. With swa_aware=True FlexKV clamps the Full-KV
+            # transfer to the reusable SWA window (usable = min(full_hit,
+            # swa_hit)) from the same radix match and builds the SWA H2D as an
+            # is_swa=True peer op on the SAME transfer graph; start_load_kv
+            # late-binds that op's GPU slot via swa_slot_mappings. There is no
+            # separate SWA mask — the returned mask already reflects the clamp.
+            result = self.kv_manager.get_match(
+                token_ids=token_ids_np,
+                token_mask=token_mask,
+                swa_aware=self._swa_kv_pool is not None,
+            )
 
-                if result is None:
-                    logger.warning("[FlexKV] get_match returned None, treating as no hit")
-                    flexkv_task_id = -1
-                    hit_length = 0
-                else:
-                    flexkv_task_id, matched_mask = result
-                    hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
+            if result is None:
+                logger.warning("[FlexKV] get_match returned None, treating as no hit")
+                flexkv_task_id = -1
+                hit_length = 0
+            else:
+                flexkv_task_id, matched_mask = result
+                hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
 
             if not update_state_for_load and flexkv_task_id >= 0:
                 # Only cancel if the task actually has pending work.  When
@@ -593,20 +577,6 @@ class FlexKVConnector(BaseKVConnector):
                 ## GPU hit length is the zero length of token masks
                 gpu_hit_length = torch.logical_not(token_mask).sum()
                 logger.debug(f"[FlexKV Connector] gpu hit length: {gpu_hit_length}, Flexkv hit length: {hit_length}")
-
-                # SWA: mark this request for trailing-window H2D restore in start_load_kv; here we only need to remember that this rid has an SWA window to restore.
-                if (
-                    hit_length > 0
-                    and self._swa_kv_pool is not None
-                    and matched_mask_swa is not None
-                    and bool(np.asarray(matched_mask_swa).any())
-                    and rid is not None
-                ):
-                    self._pending_swa_token_ids[rid] = token_ids_np[:hit_length].copy()
-                    logger.info(
-                        f"[FlexKV-SWA] get_match_swa hit: hit_length={hit_length}, "
-                        f"swa_window_marked=True, rid={rid}"
-                    )
 
         if self._sync_ctx.needs_sync:
             data = self._sync_ctx.scatter(
@@ -638,7 +608,6 @@ class FlexKVConnector(BaseKVConnector):
 
     def release_load_state(self, rid: str) -> None:
         fkv_tid = self._pending_loads.pop(rid, -1)
-        self._pending_swa_token_ids.pop(rid, None)
         if fkv_tid >= 0 and self._sync_ctx.is_sync_leader:
             self.kv_manager.cancel([fkv_tid])
 
@@ -650,24 +619,26 @@ class FlexKVConnector(BaseKVConnector):
         flexkv_task_ids: List[int] = []
         slot_mappings: List[torch.Tensor] = []
         # Parallel to slot_mappings: per-task SWA GPU slot mapping (or None).
-        # FlexKV built the SWA H2D op at get_match_swa time; launch() late-binds
-        # its GPU slot from this mapping. None leaves the op at its built ids
-        # (no-op when this request has no SWA reuse window).
+        # FlexKV built the SWA H2D op (if any) at get_match(swa_aware=True) time;
+        # launch() late-binds its GPU slot from this mapping. The mapping is the
+        # Full-KV device_indices translated into SWA-pool token slot ids. When
+        # the request has no SWA reuse window the graph carries no SWA op and the
+        # mapping is simply ignored (set_gpu_blocks only rebinds ops that exist).
         swa_slot_mappings: List[Optional[torch.Tensor]] = []
 
         for op in load_ops:
             fkv_tid = self._pending_loads.pop(op.rid, -1)
             if fkv_tid < 0:
                 continue
-            # SWA data-plane restore: instead of a Python-side H2D copy, hand
-            # FlexKV the SWA GPU slot mapping for this op so its transfer worker
-            # moves the trailing-window SWA KV as an is_swa=True peer op alongside
-            # the Full-KV H2D. The mapping is the Full-KV device_indices translated
-            # into SWA-pool token slot ids (SWA-pool index space; FlexKV folds it
-            # by tokens_per_block, == swa_page_size on DSv4).
-            had_pending_swa_restore = self._pending_swa_token_ids.pop(op.rid, None) is not None
+            # SWA data-plane restore: hand FlexKV the SWA GPU slot mapping for
+            # this op so its transfer worker moves the trailing-window SWA KV as
+            # an is_swa=True peer op alongside the Full-KV H2D. The mapping is the
+            # Full-KV device_indices translated into SWA-pool token slot ids
+            # (SWA-pool index space; FlexKV folds it by tokens_per_block, ==
+            # swa_page_size on DSv4). Built unconditionally when an SWA pool is
+            # registered — the SWA op rides the same Full-KV H2D of every load.
             swa_sm: Optional[torch.Tensor] = None
-            if had_pending_swa_restore and self._swa_kv_pool is not None:
+            if self._swa_kv_pool is not None:
                 try:
                     swa_sm = self._build_swa_slot_mapping(op.device_indices)
                     logger.info(
@@ -702,7 +673,7 @@ class FlexKVConnector(BaseKVConnector):
                     f"block_count={block_stats.get('block_count', 0)}, "
                     f"block_min={block_stats.get('block_min', 'n/a')}, "
                     f"block_max={block_stats.get('block_max', 'n/a')}, "
-                    f"pending_swa_restore={had_pending_swa_restore}"
+                    f"swa_restore={swa_sm is not None}"
                 )
             except Exception as e:
                 logger.warning(
@@ -1041,7 +1012,6 @@ class FlexKVConnector(BaseKVConnector):
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_loads.pop(rid, None)
-        self._pending_swa_token_ids.pop(rid, None)
         prefetch_task_id = self._ongoing_prefetches.pop(rid, -1)
         if self._sync_ctx.is_sync_leader and prefetch_task_id >= 0:
             # Flexkv not support cancel prefetch task yet
@@ -1061,7 +1031,6 @@ class FlexKVConnector(BaseKVConnector):
             if pending_tids:
                 self.kv_manager.cancel(pending_tids)
         self._pending_loads.clear()
-        self._pending_swa_token_ids.clear()
         self._ongoing_prefetches.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()

@@ -118,6 +118,18 @@ class ExtendedRadixCache(BasePrefixCache):
 
         uncached_len = len(key) - device_indices.numel()
         if uncached_len <= 0:
+            # Pure "only need SWA" case: the device tree already covers the whole
+            # key (nothing new to load), but the trailing sliding-window SWA may
+            # have been evicted from the GPU SWA pool. FlexKV has no swa-only
+            # transfer mode, so we roll the last window page(s) back into a
+            # full+swa transfer that OVERWRITES the resident full slots (same
+            # bytes) and revives their SWA. See _maybe_init_swa_revive +
+            # init_load_back's revive branch. When it does not apply (no SWA
+            # eviction / CPU miss / not a load-bound match) it is a no-op and we
+            # fall through to the normal early-return.
+            revive_result = self._maybe_init_swa_revive(params, device_match_result)
+            if revive_result is not None:
+                return revive_result
             if params.req is not None:
                 params.req.cached_tokens_extended_device = 0
             return device_match_result
@@ -132,19 +144,9 @@ class ExtendedRadixCache(BasePrefixCache):
         token_mask = torch.zeros(n, dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
-        swa_mask = None
-        allocator = self._inner_radixtree.token_to_kv_pool_allocator
-        if self.supports_swa() and device_indices.numel() > 0:
-            mapping = getattr(allocator, "full_to_swa_index_mapping", None)
-            if mapping is not None:
-                swa_slots = mapping[device_indices]
-                swa_mask = torch.zeros(n, dtype=torch.bool)
-                swa_mask[: device_indices.numel()] = (swa_slots == 0).cpu()
-
         new_hit_length = self._connector.get_new_hit_length(
             token_ids=token_ids_for_connector,
             token_mask=token_mask,
-            swa_mask=swa_mask,
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
         )
@@ -159,6 +161,237 @@ class ExtendedRadixCache(BasePrefixCache):
             best_match_node=last_device_node,
             host_hit_length=new_hit_length,
         )
+
+    def _swa_revive_page_count(self) -> int:
+        """Number of trailing pages to roll back to cover the SWA window.
+
+        DSv4 has window_size == page_size, so this is 1 page. For a larger
+        window it is ceil(window / page). Returns 0 when SWA is off.
+        """
+        page_size = self.page_size or 1
+        window_size = getattr(self._connector, "_swa_window_size", 0) or 0
+        if window_size <= 0:
+            return 0
+        return (window_size + page_size - 1) // page_size
+
+    def _maybe_init_swa_revive(
+        self,
+        params: MatchPrefixParams,
+        device_match_result: MatchResult,
+    ) -> Optional[MatchResult]:
+        """Trigger a full+swa overwrite-restore for a resident tail whose SWA
+        was evicted from the GPU SWA pool (the pure "only need SWA" case).
+
+        Only fires when:
+          * this is a load-bound match (update_connector_state),
+          * the inner cache is hybrid-SWA and exposes full_to_swa_index_mapping,
+          * the device match covers at least ``k`` window pages, and the last
+            ``k`` pages have full->swa mapping == 0 (SWA evicted), and
+          * FlexKV actually holds the full+swa for those pages on the host.
+
+        On success it builds a FlexKV transfer for the trailing ``k`` pages,
+        stashes ``req._flexkv_swa_revive`` (consumed by init_load_back's revive
+        branch), sets ``req.host_hit_length`` to the transfer length, and returns
+        a MatchResult. Returns None (no-op) on any unmet condition — the caller
+        then falls through to the normal early-return.
+        """
+        req = params.req
+        if req is None or not params.update_connector_state:
+            return None
+        if not self.supports_swa():
+            return None
+
+        allocator = self._inner_radixtree.token_to_kv_pool_allocator
+        mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+        if mapping is None or not hasattr(allocator, "alloc_extend_swa_tail"):
+            return None
+
+        device_indices = device_match_result.device_indices
+        page_size = self.page_size or 1
+        k_pages = self._swa_revive_page_count()
+        if k_pages <= 0 or page_size <= 1:
+            return None
+
+        revive_tokens = k_pages * page_size
+        if device_indices.numel() < revive_tokens:
+            return None
+
+        # Is the trailing window's SWA evicted from the GPU SWA pool?
+        tail_full_slots = device_indices[-revive_tokens:]
+        if not bool((mapping[tail_full_slots] == 0).any().item()):
+            # SWA still resident — nothing to restore.
+            return None
+
+        # Ask FlexKV for full+swa of ONLY the trailing window: mark the last
+        # revive_tokens positions True, everything before them False. len(key)
+        # is the logical (possibly bigram) length; token_ids is sliced to match.
+        n = len(key := params.key)
+        token_ids_for_connector = (
+            key.token_ids[:n] if hasattr(key, "token_ids") else key.token_ids
+        )
+        token_mask = torch.zeros(n, dtype=torch.bool)
+        revive_start = n - revive_tokens
+        if revive_start < 0:
+            return None
+        token_mask[revive_start:] = True
+
+        new_hit_length = self._connector.get_new_hit_length(
+            token_ids=token_ids_for_connector,
+            token_mask=token_mask,
+            update_state_for_load=True,
+            rid=req.rid,
+        )
+
+        # CPU must hold the whole trailing window (full+swa). If FlexKV matched
+        # fewer tokens than we rolled back, the overwrite premise fails — release
+        # and fall through (correctness preserved, just no SWA reuse this time).
+        if new_hit_length < revive_tokens:
+            self._connector.release_load_state(req.rid)
+            return None
+
+        # Stash for init_load_back's revive branch. The revive full slots are the
+        # trailing window's ORIGINAL device slots (page-contiguous); FlexKV will
+        # H2D full+swa into these same slots (full bytes identical; swa restored).
+        req._flexkv_swa_revive = {
+            "full_slots": tail_full_slots.clone(),
+            "num_tokens": revive_tokens,
+            "node": device_match_result.last_device_node,
+        }
+        req.host_hit_length = revive_tokens
+        req.cached_tokens_extended_device = 0
+
+        return MatchResult(
+            device_indices=device_indices,
+            last_device_node=device_match_result.last_device_node,
+            last_host_node=device_match_result.last_device_node,
+            best_match_node=device_match_result.last_device_node,
+            host_hit_length=revive_tokens,
+        )
+
+    def _init_load_back_swa_revive(self, req, revive, empty_indices):
+        """Queue a full+swa H2D that overwrites the resident trailing window and
+        revives its evicted SWA (pure "only need SWA" case).
+
+        ``revive`` is the dict stashed by _maybe_init_swa_revive:
+        ``{"full_slots": <k*page original device slots>, "num_tokens": k*page,
+        "node": <tombstone tail node>}``.
+
+        Unlike the normal load-back path this allocates NO new full slots and
+        does NOT append to ``req.prefix_indices`` — the full KV is already
+        resident and staying put; only the SWA is (re)allocated and its H2D
+        rides the same FlexKV task. We:
+          1. alloc SWA slots for the window and write full->swa mapping so the
+             connector's translate_loc_from_full_to_swa lands the SWA H2D on
+             them (this MUST precede start_load_kv),
+          2. revive the tombstone tail in place (no free — the full slots are
+             unchanged), so inc_lock_ref can take the paired full+swa lock,
+          3. inc_lock_ref the revived node for the async H2D lifetime, and
+          4. queue the load op against the ORIGINAL full slots.
+
+        Returns (empty_indices, req.last_node) on success (no new slots to hand
+        back to schedule_policy), or None if a precondition is unmet (caller
+        then releases and no-ops).
+        """
+        # Clear the marker up-front so no downstream path re-enters this branch.
+        req._flexkv_swa_revive = None
+
+        allocator = self._inner_radixtree.token_to_kv_pool_allocator
+        node = revive.get("node")
+        full_slots = revive.get("full_slots")
+        num_tokens = int(revive.get("num_tokens", 0))
+        if (
+            node is None
+            or node is self._inner_radixtree.root_node
+            or full_slots is None
+            or full_slots.numel() != num_tokens
+            or num_tokens <= 0
+        ):
+            return None
+
+        # The window must fit inside this single (deepest matched) node so that
+        # reviving it covers the whole restored SWA tail. last_device_node's own
+        # slots end at the global device-match tail, so when it is at least
+        # ``num_tokens`` long its trailing slots ARE ``full_slots``. If it is
+        # shorter, the window spans into the parent (multi-node) — out of scope
+        # for this simplified revive; fall back to no-op.
+        node_value = getattr(node, "value", None)
+        if node_value is None or len(node_value) < num_tokens:
+            return None
+
+        # Only the hybrid-SWA allocator supports the SWA sub-pool + mapping API.
+        swa_sub_allocator = getattr(allocator, "swa_attn_allocator", None)
+        if (
+            swa_sub_allocator is None
+            or not hasattr(allocator, "swa_available_size")
+            or not hasattr(allocator, "set_full_to_swa_mapping")
+        ):
+            return None
+
+        if allocator.swa_available_size() < num_tokens:
+            # Try to make room; SWA pressure is evicted by the shared helper.
+            from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+            evict_from_tree_cache(self, 0, swa_num_tokens=num_tokens)
+            if allocator.swa_available_size() < num_tokens:
+                return None
+
+        # 1) Allocate ONLY SWA sub-pool slots for the window (the full slots are
+        #    reused, not reallocated) and wire the full->swa mapping so the
+        #    connector's translate() sends the SWA H2D onto them. This mirrors
+        #    how alloc_extend_swa_tail allocates its SWA tail: a fresh extend
+        #    from prefix 0 with a -1 last_loc sentinel. NOTE: allocator.alloc()
+        #    is unusable here — it asserts page_size==1 and would also allocate a
+        #    parallel set of full slots, defeating the reuse.
+        device = self._inner_radixtree.device
+        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
+        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+        swa_seq_lens = torch.tensor([num_tokens], dtype=torch.int64, device=device)
+        swa_seq_lens_cpu = torch.tensor([num_tokens], dtype=torch.int64)
+        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        swa_indices = swa_sub_allocator.alloc_extend(
+            swa_prefix_lens,
+            swa_prefix_lens_cpu,
+            swa_seq_lens,
+            swa_seq_lens_cpu,
+            swa_last_loc,
+            num_tokens,
+        )
+        if swa_indices is None or swa_indices.numel() != num_tokens:
+            return None
+        allocator.set_full_to_swa_mapping(full_slots, swa_indices)
+
+        # 2) Revive the tombstone tail in place. _revive_tombstone_tail reads the
+        #    (now non-zero) mapping, un-tombstones the mapped suffix, and fixes
+        #    swa accounting. It does NOT free full slots, so the resident KV that
+        #    FlexKV is about to overwrite stays owned by the node.
+        if getattr(node, "swa_tombstone", False):
+            self._inner_radixtree._revive_tombstone_tail(node, node.value)
+
+        # 3) Lock the (now non-tombstone) node for the async H2D lifetime, taking
+        #    the paired full+swa lock; dec happens in _check_load_completion.
+        inc_result = self._flexkv_inc_lock(
+            node,
+            "init_load_back:swa_revive",
+            rid=req.rid,
+            num_tokens=num_tokens,
+        )
+        swa_uuid = getattr(inc_result, "swa_uuid_for_lock", None)
+
+        # 4) Queue the load op against the ORIGINAL resident full slots. FlexKV
+        #    H2Ds full (same bytes) + swa (into the freshly mapped slots).
+        self._load_queue.append(
+            LoadOperation(
+                rid=req.rid,
+                device_indices=full_slots,
+                node=node,
+            )
+        )
+        if not hasattr(self, "_load_queue_swa_uuids"):
+            self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
+        self._load_queue_swa_uuids[id(self._load_queue[-1])] = swa_uuid
+
+        # No new full slots: prefix_indices unchanged, last_node unchanged.
+        return empty_indices, req.last_node
 
     def init_load_back(
         self,
@@ -188,6 +421,21 @@ class ExtendedRadixCache(BasePrefixCache):
         if host_hit_length <= 0 or (
             mem_quota is not None and host_hit_length > mem_quota
         ):
+            self._connector.release_load_state(req.rid)
+            return empty_indices, req.last_node
+
+        # SWA revive-overwrite branch (pure "only need SWA" case, set up by
+        # _maybe_init_swa_revive). The trailing window's full KV is already
+        # resident; FlexKV re-transfers full+swa INTO THOSE SAME slots and we
+        # revive their evicted SWA. No new full alloc, no prefix_indices append.
+        revive = getattr(req, "_flexkv_swa_revive", None)
+        if revive is not None:
+            result = self._init_load_back_swa_revive(req, revive, empty_indices)
+            if result is not None:
+                return result
+            # Revive failed some precondition — fall through would double-load;
+            # instead release and no-op (the resident KV is still correct, just
+            # without SWA reuse this round).
             self._connector.release_load_state(req.rid)
             return empty_indices, req.last_node
 
