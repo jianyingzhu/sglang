@@ -44,6 +44,10 @@ class ExtendedRadixCache(BasePrefixCache):
 
         self._load_task_id_counter = 0
         self._load_queue: List[LoadOperation] = []
+        # Maps id(LoadOperation) -> swa_uuid_for_lock, populated when a load op
+        # is queued and drained in ready_to_load_host_cache. Keyed by op identity
+        # because ops live only until they transfer into _ongoing_load_tasks.
+        self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
         self._ongoing_load_tasks: Dict[int, List[TreeNode]] = {}
         self._ongoing_store_tasks: Dict[int, TreeNode] = {}
 
@@ -101,6 +105,7 @@ class ExtendedRadixCache(BasePrefixCache):
         self._ongoing_store_tasks.clear()
         self._ongoing_load_tasks.clear()
         self._load_queue.clear()
+        self._load_queue_swa_uuids.clear()
 
         if self._connector is not None:
             self._connector.reset()
@@ -192,7 +197,8 @@ class ExtendedRadixCache(BasePrefixCache):
         page_size = self.page_size or 1
         # FlexKV manages SWA at PAGE granularity and DSv4's window == 1 page,
         # so reviving the SWA means rolling back exactly one trailing page.
-        if not self.supports_swa() or page_size <= 1:
+        # (supports_swa() already checked above.)
+        if page_size <= 1:
             return None
 
         revive_tokens = page_size  # 1 page
@@ -209,9 +215,9 @@ class ExtendedRadixCache(BasePrefixCache):
         # revive_tokens positions True, everything before them False. len(key)
         # is the logical (possibly bigram) length; token_ids is sliced to match.
         n = len(key := params.key)
-        token_ids_for_connector = (
-            key.token_ids[:n] if hasattr(key, "token_ids") else key.token_ids
-        )
+        # RadixKey always has token_ids; slice to the logical (possibly bigram)
+        # length so it matches len(key).
+        token_ids_for_connector = key.token_ids[:n]
         token_mask = torch.zeros(n, dtype=torch.bool)
         revive_start = n - revive_tokens
         if revive_start < 0:
@@ -369,8 +375,7 @@ class ExtendedRadixCache(BasePrefixCache):
                 node=node,
             )
         )
-        if not hasattr(self, "_load_queue_swa_uuids"):
-            self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
+        # Pair the op with its swa_uuid by op identity (see __init__).
         self._load_queue_swa_uuids[id(self._load_queue[-1])] = swa_uuid
 
         # No new full slots: prefix_indices unchanged, last_node unchanged.
@@ -705,13 +710,7 @@ class ExtendedRadixCache(BasePrefixCache):
                 node=new_node,
             )
         )
-        # Track the (node, swa_uuid) pair keyed by op identity so
-        # ready_to_load_host_cache can pair load_ops with their swa_uuids
-        # when stashing into _ongoing_load_tasks. Using id() of the
-        # LoadOperation works because load_ops live until ready_to_load
-        # transfers them to _ongoing_load_tasks (then we drop this).
-        if not hasattr(self, '_load_queue_swa_uuids'):
-            self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
+        # Pair the op with its swa_uuid by op identity (see __init__).
         self._load_queue_swa_uuids[id(self._load_queue[-1])] = load_swa_uuid
 
         req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
@@ -733,7 +732,7 @@ class ExtendedRadixCache(BasePrefixCache):
         # right swa_uuid_for_lock to dec_lock_ref. Without the swa_uuid,
         # SWARadixCache.dec_lock_ref walks the SWA chain to root which can
         # underflow swa_lock_ref or hit ``dec_lock_ref on swa_tombstone node``.
-        uuid_map = getattr(self, '_load_queue_swa_uuids', {})
+        uuid_map = self._load_queue_swa_uuids
         nodes_with_uuid = [
             (op.node, uuid_map.pop(id(op), None)) for op in self._load_queue
         ]
