@@ -118,15 +118,9 @@ class ExtendedRadixCache(BasePrefixCache):
 
         uncached_len = len(key) - device_indices.numel()
         if uncached_len <= 0:
-            # Pure "only need SWA" case: the device tree already covers the whole
-            # key (nothing new to load), but the trailing sliding-window SWA may
-            # have been evicted from the GPU SWA pool. FlexKV has no swa-only
-            # transfer mode, so we roll the last window page(s) back into a
-            # full+swa transfer that OVERWRITES the resident full slots (same
-            # bytes) and revives their SWA. See _maybe_init_swa_revive +
-            # init_load_back's revive branch. When it does not apply (no SWA
-            # eviction / CPU miss / not a load-bound match) it is a no-op and we
-            # fall through to the normal early-return.
+            # Pure "only need SWA" case: FlexKV has no swa-only transfer mode, so we roll the last window page(s) back into a full+swa transfer that OVERWRITES the resident full slots (same
+            # bytes) and revives their SWA. See _maybe_init_swa_revive + init_load_back's revive branch. When it does not apply (no SWA eviction / CPU miss / not a load-bound match) it is a
+            # no-op and we fall through to the normal early-return.
             revive_result = self._maybe_init_swa_revive(params, device_match_result)
             if revive_result is not None:
                 return revive_result
@@ -165,14 +159,13 @@ class ExtendedRadixCache(BasePrefixCache):
     def _swa_revive_page_count(self) -> int:
         """Number of trailing pages to roll back to cover the SWA window.
 
-        DSv4 has window_size == page_size, so this is 1 page. For a larger
-        window it is ceil(window / page). Returns 0 when SWA is off.
+        FlexKV manages SWA at PAGE granularity — one pool slot holds exactly one
+        ``page_size`` page — so the sliding window is a single trailing page.
+        Returns 1 when SWA is on, 0 when SWA is off.
         """
-        page_size = self.page_size or 1
-        window_size = getattr(self._connector, "_swa_window_size", 0) or 0
-        if window_size <= 0:
+        if not self.supports_swa() or (self.page_size or 1) <= 1:
             return 0
-        return (window_size + page_size - 1) // page_size
+        return 1
 
     def _maybe_init_swa_revive(
         self,
@@ -452,8 +445,10 @@ class ExtendedRadixCache(BasePrefixCache):
         #     `window` tokens of SWA data on the host side anyway.
         allocator = self._inner_radixtree.token_to_kv_pool_allocator
         page_size = getattr(allocator, "page_size", 1) or 1
-        # Pull window size from the connector if it exposes one (FlexKV does).
-        window_size = getattr(self._connector, "_swa_window_size", 0) or 0
+        # FlexKV SWA window == 1 page (page-granularity SWA). Express it in
+        # tokens as one page so the ceil-to-page tail math below is unchanged.
+        # 0 when SWA is off — falls back to the plain (non-SWA) alloc path.
+        window_size = page_size if self.supports_swa() else 0
         # Detect hybrid-SWA paged allocator by the alloc_extend_swa_tail method.
         has_swa_tail = hasattr(allocator, "alloc_extend_swa_tail")
 

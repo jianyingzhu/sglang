@@ -454,18 +454,6 @@ class FlexKVConnector(BaseKVConnector):
         self._draft_kv_pool = getattr(params, 'draft_token_to_kv_pool', None)
         self._draft_swa_layer_group = None  # populated by _attach_draft_pool()
 
-        # SWA config (cache_config.swa + enable_swa_transfer) is populated by
-        # FlexKVConfig.post_init_from_sglang_config for DSv4 with the correct
-        # padded bytes-per-token; the connector no longer derives it.
-        #
-        # NOTE: FlexKV manages SWA at PAGE granularity — one pool slot stores
-        # exactly one ``tokens_per_block`` page and the SWA "window" degenerates
-        # to a single trailing page (see SWAPoolConfig / radixtree SWA lock).
-        # There is therefore no ``window_size`` field on SWAPoolConfig anymore;
-        # the geometry is fully described by ``bytes_per_token_per_layer`` and
-        # the page size. (The old ``self._swa_window_size`` read of
-        # ``cache_config.swa.window_size`` raised AttributeError and silently
-        # disabled the whole connector — do not reintroduce it.)
         self._swa_bytes_per_token_per_layer = (
             cache_config.swa.bytes_per_token_per_layer
             if cache_config.swa is not None and hasattr(cache_config.swa, 'bytes_per_token_per_layer')
@@ -544,13 +532,7 @@ class FlexKVConnector(BaseKVConnector):
         #       TP/CP group's behalf and broadcast the result to the rest of the group.
         if self._sync_ctx.is_sync_leader:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            # A single get_match covers both the plain (MLA / MHA / NSA) and the
-            # SWA-aware path. With swa_aware=True FlexKV clamps the Full-KV
-            # transfer to the reusable SWA window (usable = min(full_hit,
-            # swa_hit)) from the same radix match and builds the SWA H2D as an
-            # is_swa=True peer op on the SAME transfer graph; start_load_kv
-            # late-binds that op's GPU slot via swa_slot_mappings. There is no
-            # separate SWA mask — the returned mask already reflects the clamp.
+            # A single get_match covers SWA-aware path. With swa_aware=True FlexKV clamps the Full-KV transfer to the reusable SWA window from the same radix match and builds the SWA H2D as an is_swa=True peer op on the SAME transfer graph
             result = self.kv_manager.get_match(
                 token_ids=token_ids_np,
                 token_mask=token_mask,
@@ -618,25 +600,13 @@ class FlexKVConnector(BaseKVConnector):
     ) -> None:
         flexkv_task_ids: List[int] = []
         slot_mappings: List[torch.Tensor] = []
-        # Parallel to slot_mappings: per-task SWA GPU slot mapping (or None).
-        # FlexKV built the SWA H2D op (if any) at get_match(swa_aware=True) time;
-        # launch() late-binds its GPU slot from this mapping. The mapping is the
-        # Full-KV device_indices translated into SWA-pool token slot ids. When
-        # the request has no SWA reuse window the graph carries no SWA op and the
-        # mapping is simply ignored (set_gpu_blocks only rebinds ops that exist).
         swa_slot_mappings: List[Optional[torch.Tensor]] = []
 
         for op in load_ops:
             fkv_tid = self._pending_loads.pop(op.rid, -1)
             if fkv_tid < 0:
                 continue
-            # SWA data-plane restore: hand FlexKV the SWA GPU slot mapping for
-            # this op so its transfer worker moves the trailing-window SWA KV as
-            # an is_swa=True peer op alongside the Full-KV H2D. The mapping is the
-            # Full-KV device_indices translated into SWA-pool token slot ids
-            # (SWA-pool index space; FlexKV folds it by tokens_per_block, ==
-            # swa_page_size on DSv4). Built unconditionally when an SWA pool is
-            # registered — the SWA op rides the same Full-KV H2D of every load.
+            
             swa_sm: Optional[torch.Tensor] = None
             if self._swa_kv_pool is not None:
                 try:
