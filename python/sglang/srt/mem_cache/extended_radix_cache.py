@@ -156,17 +156,6 @@ class ExtendedRadixCache(BasePrefixCache):
             host_hit_length=new_hit_length,
         )
 
-    def _swa_revive_page_count(self) -> int:
-        """Number of trailing pages to roll back to cover the SWA window.
-
-        FlexKV manages SWA at PAGE granularity — one pool slot holds exactly one
-        ``page_size`` page — so the sliding window is a single trailing page.
-        Returns 1 when SWA is on, 0 when SWA is off.
-        """
-        if not self.supports_swa() or (self.page_size or 1) <= 1:
-            return 0
-        return 1
-
     def _maybe_init_swa_revive(
         self,
         params: MatchPrefixParams,
@@ -201,11 +190,12 @@ class ExtendedRadixCache(BasePrefixCache):
 
         device_indices = device_match_result.device_indices
         page_size = self.page_size or 1
-        k_pages = self._swa_revive_page_count()
-        if k_pages <= 0 or page_size <= 1:
+        # FlexKV manages SWA at PAGE granularity and DSv4's window == 1 page,
+        # so reviving the SWA means rolling back exactly one trailing page.
+        if not self.supports_swa() or page_size <= 1:
             return None
 
-        revive_tokens = k_pages * page_size
+        revive_tokens = page_size  # 1 page
         if device_indices.numel() < revive_tokens:
             return None
 
