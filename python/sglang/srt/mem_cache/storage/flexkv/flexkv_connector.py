@@ -1066,7 +1066,22 @@ class FlexKVConnector(BaseKVConnector):
             return None
         swa_indices = translate(full_indices)
         swa_cpu = swa_indices.cpu() if swa_indices.is_cuda else swa_indices
-        return swa_cpu.to(torch.int64)
+        swa_cpu = swa_cpu.to(torch.int64)
+
+        # Drop the unmapped swa slot-0 sentinel head so FlexKV's head-anchored fold
+        # binds to the real SWA window.
+        mapped = swa_cpu > 0
+        if not bool(mapped.any()):
+            return None
+        unmapped_positions = (~mapped).nonzero(as_tuple=False)
+        if unmapped_positions.numel() > 0:
+            start = int(unmapped_positions[-1].item()) + 1
+            swa_cpu = swa_cpu[start:]
+        assert bool((swa_cpu > 0).all()), (
+            "SWA slot mapping still contains the reserved slot-0 sentinel after "
+            f"trimming: {swa_cpu.tolist()}"
+        )
+        return swa_cpu
 
     # ---- Private helpers ----
 
