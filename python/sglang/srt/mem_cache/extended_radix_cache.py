@@ -44,6 +44,10 @@ class ExtendedRadixCache(BasePrefixCache):
 
         self._load_task_id_counter = 0
         self._load_queue: List[LoadOperation] = []
+        # Maps id(LoadOperation) -> swa_uuid_for_lock, populated when a load op
+        # is queued and drained in ready_to_load_host_cache. Keyed by op identity
+        # because ops live only until they transfer into _ongoing_load_tasks.
+        self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
         self._ongoing_load_tasks: Dict[int, List[TreeNode]] = {}
         self._ongoing_store_tasks: Dict[int, TreeNode] = {}
 
@@ -101,6 +105,7 @@ class ExtendedRadixCache(BasePrefixCache):
         self._ongoing_store_tasks.clear()
         self._ongoing_load_tasks.clear()
         self._load_queue.clear()
+        self._load_queue_swa_uuids.clear()
 
         if self._connector is not None:
             self._connector.reset()
@@ -118,6 +123,11 @@ class ExtendedRadixCache(BasePrefixCache):
 
         uncached_len = len(key) - device_indices.numel()
         if uncached_len <= 0:
+            # Device match covers the whole key; nothing to load back from the
+            # connector. (A hybrid-SWA tail whose SWA was evicted is trimmed out
+            # of device_indices by the matcher, so it surfaces as uncached_len>0
+            # below and is handled by the normal host load-back path — the same
+            # path that correctly re-transfers its full+swa.)
             if params.req is not None:
                 params.req.cached_tokens_extended_device = 0
             return device_match_result
@@ -132,19 +142,9 @@ class ExtendedRadixCache(BasePrefixCache):
         token_mask = torch.zeros(n, dtype=torch.bool)
         token_mask[device_indices.numel() :] = True
 
-        swa_mask = None
-        allocator = self._inner_radixtree.token_to_kv_pool_allocator
-        if self.supports_swa() and device_indices.numel() > 0:
-            mapping = getattr(allocator, "full_to_swa_index_mapping", None)
-            if mapping is not None:
-                swa_slots = mapping[device_indices]
-                swa_mask = torch.zeros(n, dtype=torch.bool)
-                swa_mask[: device_indices.numel()] = (swa_slots == 0).cpu()
-
         new_hit_length = self._connector.get_new_hit_length(
             token_ids=token_ids_for_connector,
             token_mask=token_mask,
-            swa_mask=swa_mask,
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
         )
@@ -204,8 +204,10 @@ class ExtendedRadixCache(BasePrefixCache):
         #     `window` tokens of SWA data on the host side anyway.
         allocator = self._inner_radixtree.token_to_kv_pool_allocator
         page_size = getattr(allocator, "page_size", 1) or 1
-        # Pull window size from the connector if it exposes one (FlexKV does).
-        window_size = getattr(self._connector, "_swa_window_size", 0) or 0
+        # FlexKV SWA window == 1 page (page-granularity SWA). Express it in
+        # tokens as one page so the ceil-to-page tail math below is unchanged.
+        # 0 when SWA is off — falls back to the plain (non-SWA) alloc path.
+        window_size = page_size if self.supports_swa() else 0
         # Detect hybrid-SWA paged allocator by the alloc_extend_swa_tail method.
         has_swa_tail = hasattr(allocator, "alloc_extend_swa_tail")
 
@@ -472,13 +474,7 @@ class ExtendedRadixCache(BasePrefixCache):
                 node=new_node,
             )
         )
-        # Track the (node, swa_uuid) pair keyed by op identity so
-        # ready_to_load_host_cache can pair load_ops with their swa_uuids
-        # when stashing into _ongoing_load_tasks. Using id() of the
-        # LoadOperation works because load_ops live until ready_to_load
-        # transfers them to _ongoing_load_tasks (then we drop this).
-        if not hasattr(self, '_load_queue_swa_uuids'):
-            self._load_queue_swa_uuids: Dict[int, Optional[int]] = {}
+        # Pair the op with its swa_uuid by op identity (see __init__).
         self._load_queue_swa_uuids[id(self._load_queue[-1])] = load_swa_uuid
 
         req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
@@ -500,7 +496,7 @@ class ExtendedRadixCache(BasePrefixCache):
         # right swa_uuid_for_lock to dec_lock_ref. Without the swa_uuid,
         # SWARadixCache.dec_lock_ref walks the SWA chain to root which can
         # underflow swa_lock_ref or hit ``dec_lock_ref on swa_tombstone node``.
-        uuid_map = getattr(self, '_load_queue_swa_uuids', {})
+        uuid_map = self._load_queue_swa_uuids
         nodes_with_uuid = [
             (op.node, uuid_map.pop(id(op), None)) for op in self._load_queue
         ]
