@@ -881,29 +881,45 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+            # init_load_back() allocates GPU KV slots + fires the H2D and appends the restored slots to
+            # req.prefix_indices while leaving them OUT of the radix tree (req-owned/uncached). Previously it ran HERE, before the OTHER/
+            # NO_TOKEN bails below — a bail then returned without freeing those slots, and the next-round match_prefix overwrote req.prefix_indices,
+            # orphaning them (pool memory leak, exactly one restored request's worth). We now evaluate every admission check on PRE-restore
+            # quantities and only call init_load_back on a committed-accept path.
+            
+            input_tokens = real_input_tokens
+            # Predicted post-restore device prefix length (init_load_back appends
+            # exactly host_hit_length slots). Used by the chunked page-align math
+            # so it matches the original post-restore computation without having
+            # to allocate first.
+            restore_len = req.host_hit_length if req.host_hit_length > 0 else 0
+            post_restore_prefix_len = len(req.prefix_indices) + restore_len
+
+            def _fire_restore() -> int:
+                """Run the deferred host load-back and fold restored slots into
+                the request. Only invoked on a committed accept. Returns the
+                post-restore prefix length."""
+                if req.host_hit_length <= 0:
+                    return len(req.prefix_indices)
+                self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
-                # req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                # init_load_back set req.last_node / req.prefix_indices.
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                prefix_len = len(req.prefix_indices)
-                # FlexKV decoupled H2D restore (extended_radix_cache.init_load_back)
-                # appends the restored slots to prefix_indices but leaves them
-                # OUT of the radix tree (req-owned/uncached). It already pinned
-                # cache_protected_len to the pre-restore prefix length so that
+                pl = len(req.prefix_indices)
+                # See extended_radix_cache.init_load_back: it pinned
+                # cache_protected_len to the pre-restore prefix length so
                 # cache_*_req uses the correct prev_prefix_len; do NOT overwrite
                 # it with the full length here (that lie causes a pool leak).
                 if getattr(req, "_flexkv_uncached_restore", False):
                     req._flexkv_uncached_restore = False
                 else:
-                    req.cache_protected_len = prefix_len
-
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+                    req.cache_protected_len = pl
+                return pl
 
             if (
                 self.rem_chunk_tokens is None
@@ -923,16 +939,22 @@ class PrefillAdder:
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
 
+                prefix_len = _fire_restore()
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
+                prefix_len = _fire_restore()
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                # Recompute from the true post-restore extend length for the
+                # budget deduction (equals input_tokens whenever the restore
+                # grew prefix_indices by host_hit_length, i.e. the normal case;
+                # this stays correct even if init_load_back rolled its alloc back).
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
+                    self.ceil_paged_tokens(req.extend_input_len),
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
@@ -956,14 +978,17 @@ class PrefillAdder:
                             trunc_len // truncation_align_size
                         )
 
-                now_input_len = trunc_len + len(req.prefix_indices)
+                # Use the predicted post-restore prefix length so this matches
+                # the original (post-init_load_back) computation exactly.
+                now_input_len = trunc_len + post_restore_prefix_len
                 now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
+                trunc_len = now_input_len - post_restore_prefix_len
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # Chunked prefill
+                # Admission certain — fire the deferred restore, then chunk.
+                prefix_len = _fire_restore()
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
