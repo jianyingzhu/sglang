@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
@@ -535,7 +536,21 @@ class ExtendedRadixCache(BasePrefixCache):
         # AFTER insert.  These kv_indices are the tree node values (not the
         # req_to_token_pool snapshot), so they are protected by lock_ref and
         # won't be freed by the allocator while D2H transfer is in flight.
-        radix_key = RadixKey(token_ids, req.extra_key)
+        # token_ids must match the RadixKey stored in the inner tree on BOTH
+        # axes or match_prefix mis-computes prefix_len and trips the _split_node
+        # assertion in swa_radix_cache:
+        #  - dtype: inner nodes use array("q"); RadixKey.match() compares
+        #    token_ids slices with `!=` (type-sensitive: array != list is always
+        #    True), so a list key yields match()==0 while child_key() still hits
+        #    -> split at prefix_len 0 -> empty-key assert. Masked when EAGLE is on
+        #    (element-wise bigram match); exposed with speculative off (DSA CP).
+        #  - is_bigram: inner keys are built with is_bigram=self.is_eagle, so the
+        #    re-match key must carry the same flag.
+        radix_key = RadixKey(
+            array("q", token_ids),
+            req.extra_key,
+            is_bigram=bool(getattr(self._inner_radixtree, "is_eagle", False)),
+        )
         match_result = self._inner_radixtree.match_prefix(
             MatchPrefixParams(key=radix_key)
         )
@@ -726,7 +741,21 @@ class ExtendedRadixCache(BasePrefixCache):
         # AFTER the inner insert above. These indices are protected by lock_ref
         # (not the transient req_to_token_pool snapshot), so they survive the
         # in-flight D2H transfer.
-        radix_key = RadixKey(token_ids, req.extra_key)
+        # token_ids must match the RadixKey stored in the inner tree on BOTH
+        # axes or match_prefix mis-computes prefix_len and trips the _split_node
+        # assertion in swa_radix_cache:
+        #  - dtype: inner nodes use array("q"); RadixKey.match() compares
+        #    token_ids slices with `!=` (type-sensitive: array != list is always
+        #    True), so a list key yields match()==0 while child_key() still hits
+        #    -> split at prefix_len 0 -> empty-key assert. Masked when EAGLE is on
+        #    (element-wise bigram match); exposed with speculative off (DSA CP).
+        #  - is_bigram: inner keys are built with is_bigram=self.is_eagle, so the
+        #    re-match key must carry the same flag.
+        radix_key = RadixKey(
+            array("q", token_ids),
+            req.extra_key,
+            is_bigram=bool(getattr(self._inner_radixtree, "is_eagle", False)),
+        )
         match_result = self._inner_radixtree.match_prefix(
             MatchPrefixParams(key=radix_key)
         )
