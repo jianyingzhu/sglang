@@ -250,6 +250,11 @@ def build_kv_cache(
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
+        # attn_cp_rank must be forwarded so the KV connector (e.g. FlexKV) can
+        # tell its CP shards apart. Without it every worker defaults to
+        # attn_cp_rank=0, so under attn_cp_size>1 all GPUs register to the
+        # connector as cp_rank 0 and GPU registration deadlocks (X/8 forever).
+        attn_cp_rank=ps.attn_cp_rank,
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,

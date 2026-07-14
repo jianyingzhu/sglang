@@ -1926,24 +1926,31 @@ class FlexKVConnector(BaseKVConnector):
                     )
 
                 # Phase 2: Send metadata + eventfds over the connected socket.
-                # UDS is node-local, so use _per_node TP rank/size so that
-                # LayerwiseWorker builds the correct eventfd tensor shape.
                 num_counters = self._layer_done_counter.num_counters
                 model_config = self.flexkv_config.model_config
                 rank_info = self.rank_info
-                # Send 16-byte metadata: tp_rank_per_node, tp_size_per_node, num_layers, num_counters
+                # Send 16-byte metadata: effective_tp_rank, effective_tp_size_per_node,
+                # num_layers, num_counters. The rank key MUST be effective_tp_rank
+                # (the data-plane CPU-slice index = cp_rank*tp_size + tp_rank for
+                # non-MLA), NOT tp_rank_per_node: LayerwiseWorker keys
+                # all_rank_eventfds by this int and expects 0..effective_tp_size-1.
+                # Under context parallelism attn_tp collapses to 1, so
+                # tp_rank_per_node is 0 for every cp_rank -> all ranks collide on
+                # key 0 (registered 1/N), leaving the rest with invalid (-1)
+                # eventfds and their layerwise KV transfer never firing. Without
+                # CP, effective_tp_rank == tp_rank_per_node, so this is a no-op.
                 metadata = struct.pack(
                     "iiii",
-                    rank_info.tp_rank_per_node,
-                    model_config.tp_size_per_node,
+                    rank_info.effective_tp_rank,
+                    model_config.effective_tp_size_per_node,
                     rank_info.num_layers_per_pp_stage,
                     num_counters,
                 )
                 sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                    f"tp_rank_per_node={rank_info.tp_rank_per_node}, "
-                    f"tp_size_per_node={model_config.tp_size_per_node}, "
+                    f"effective_tp_rank={rank_info.effective_tp_rank}, "
+                    f"effective_tp_size_per_node={model_config.effective_tp_size_per_node}, "
                     f"num_layers={rank_info.num_layers_per_pp_stage}, num_counters={num_counters}"
                 )
 
