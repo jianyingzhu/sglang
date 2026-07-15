@@ -848,10 +848,10 @@ class PrefillAdder:
         )
         total_tokens = req.extend_input_len + max_new + self.page_size
 
-        # Admission is evaluated on PRE-restore quantities: input_tokens is the
-        # extend length after subtracting the host cache hit, page-aligned — the
-        # tokens we would actually prefill on GPU once the hit is restored.
-        input_tokens = self.ceil_paged_tokens(req.extend_input_len - req.host_hit_length)
+        # adjusting the input_tokens based on host_hit_length and page_size
+        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -864,7 +864,7 @@ class PrefillAdder:
         if (
             self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
-            and input_tokens >= self.rem_input_tokens
+            and real_input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
@@ -881,19 +881,13 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            def _fire_restore() -> int:
+            def _commit_kv_cache_load_back() -> int:
                 """Allocate GPU KV slots for the host cache hit, fire the H2D, and
                 fold the restored slots into the request. Returns the post-restore
                 device prefix length.
 
                 MUST be called only on a committed-accept path — after every check
-                that can `return OTHER/NO_TOKEN` has passed. init_load_back()
-                allocates slots and appends them to req.prefix_indices while leaving
-                them OUT of the radix tree (req-owned/uncached). If we bailed after
-                allocating, the next round's match_prefix would overwrite
-                prefix_indices and orphan those slots (pool leak, exactly one
-                restored request's worth). Hence every admission check above runs on
-                the PRE-restore `input_tokens`, and this fires last.
+                that can `return OTHER/NO_TOKEN` has passed.
                 """
                 if req.host_hit_length <= 0:
                     return len(req.prefix_indices)
@@ -906,21 +900,18 @@ class PrefillAdder:
                 )
                 # init_load_back set req.last_node / req.prefix_indices.
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-                pl = len(req.prefix_indices)
-                # See extended_radix_cache.init_load_back: it pinned
-                # cache_protected_len to the pre-restore prefix length so
-                # cache_*_req uses the correct prev_prefix_len; do NOT overwrite
-                # it with the full length here (that lie causes a pool leak).
+                # extended_radix_cache.init_load_back set cache_protected_len to the pre-load-back prefix length so cache_*_req uses the correct prev_prefix_len;
+                # do NOT overwrite it with the full length here (that lie causes a pool leak).
                 if getattr(req, "_flexkv_uncached_restore", False):
                     req._flexkv_uncached_restore = False
                 else:
-                    req.cache_protected_len = pl
-                return pl
+                    req.cache_protected_len = prefix_len
+                return prefix_len
 
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
+                and real_input_tokens >= self.rem_input_tokens
             ):
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
@@ -935,12 +926,12 @@ class PrefillAdder:
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
 
-                prefix_len = _fire_restore()
+                prefix_len = _commit_kv_cache_load_back()
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif self.rem_chunk_tokens is None or real_input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
-                prefix_len = _fire_restore()
+                prefix_len = _commit_kv_cache_load_back()
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -987,8 +978,8 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # Admission certain — fire the deferred restore, then chunk.
-                prefix_len = _fire_restore()
+                # Admission certain — commit the deferred restore, then chunk.
+                prefix_len = _commit_kv_cache_load_back()
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
