@@ -848,10 +848,10 @@ class PrefillAdder:
         )
         total_tokens = req.extend_input_len + max_new + self.page_size
 
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
-        prefix_len = len(req.prefix_indices)
+        # Admission is evaluated on PRE-restore quantities: input_tokens is the
+        # extend length after subtracting the host cache hit, page-aligned — the
+        # tokens we would actually prefill on GPU once the hit is restored.
+        input_tokens = self.ceil_paged_tokens(req.extend_input_len - req.host_hit_length)
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -864,7 +864,7 @@ class PrefillAdder:
         if (
             self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
-            and real_input_tokens >= self.rem_input_tokens
+            and input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
@@ -881,24 +881,20 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            # init_load_back() allocates GPU KV slots + fires the H2D and appends the restored slots to
-            # req.prefix_indices while leaving them OUT of the radix tree (req-owned/uncached). Previously it ran HERE, before the OTHER/
-            # NO_TOKEN bails below — a bail then returned without freeing those slots, and the next-round match_prefix overwrote req.prefix_indices,
-            # orphaning them (pool memory leak, exactly one restored request's worth). We now evaluate every admission check on PRE-restore
-            # quantities and only call init_load_back on a committed-accept path.
-            
-            input_tokens = real_input_tokens
-            # Predicted post-restore device prefix length (init_load_back appends
-            # exactly host_hit_length slots). Used by the chunked page-align math
-            # so it matches the original post-restore computation without having
-            # to allocate first.
-            restore_len = req.host_hit_length if req.host_hit_length > 0 else 0
-            post_restore_prefix_len = len(req.prefix_indices) + restore_len
-
             def _fire_restore() -> int:
-                """Run the deferred host load-back and fold restored slots into
-                the request. Only invoked on a committed accept. Returns the
-                post-restore prefix length."""
+                """Allocate GPU KV slots for the host cache hit, fire the H2D, and
+                fold the restored slots into the request. Returns the post-restore
+                device prefix length.
+
+                MUST be called only on a committed-accept path — after every check
+                that can `return OTHER/NO_TOKEN` has passed. init_load_back()
+                allocates slots and appends them to req.prefix_indices while leaving
+                them OUT of the radix tree (req-owned/uncached). If we bailed after
+                allocating, the next round's match_prefix would overwrite
+                prefix_indices and orphan those slots (pool leak, exactly one
+                restored request's worth). Hence every admission check above runs on
+                the PRE-restore `input_tokens`, and this fires last.
+                """
                 if req.host_hit_length <= 0:
                     return len(req.prefix_indices)
                 self.tree_cache.init_load_back(
@@ -978,8 +974,12 @@ class PrefillAdder:
                             trunc_len // truncation_align_size
                         )
 
-                # Use the predicted post-restore prefix length so this matches
-                # the original (post-init_load_back) computation exactly.
+                # Page-align against the PREDICTED post-restore prefix length
+                # (init_load_back appends exactly host_hit_length slots), so this
+                # matches the original post-restore computation without allocating.
+                post_restore_prefix_len = len(req.prefix_indices) + max(
+                    req.host_hit_length, 0
+                )
                 now_input_len = trunc_len + post_restore_prefix_len
                 now_input_len = now_input_len // self.page_size * self.page_size
                 trunc_len = now_input_len - post_restore_prefix_len
