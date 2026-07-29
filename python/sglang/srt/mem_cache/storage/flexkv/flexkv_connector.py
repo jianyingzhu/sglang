@@ -692,6 +692,20 @@ class FlexKVConnector:
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
 
+        # Invalidate FlexKV's backing store (host / SSD / remote radix tree +
+        # mempool) so KV computed against stale weights can no longer be
+        # matched after a weight update. sglang reaches this via /flush_cache ->
+        # scheduler.flush_cache() -> tree_cache.reset() -> FlexKVConnector.reset(),
+        # which by itself only cancels in-flight lookups and drains local
+        # bookkeeping above; without this the FlexKV CPU pool keeps stale data.
+        # Only the sync leader holds the KVManager; do it last so in-flight
+        # lookups are cancelled and in-flight stores drained before the drop.
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                self.kv_manager.reset()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[FlexKV] kv_manager.reset: %s", exc)
+
     def shutdown(self) -> None:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
